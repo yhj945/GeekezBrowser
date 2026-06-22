@@ -12,6 +12,17 @@
         <label class="label-tiny">{{ $t('tagsLabel') }}</label>
         <input v-model="form.tags" type="text" placeholder="tiktok, fb..." spellcheck="false" autocomplete="off">
 
+        <label class="label-tiny">{{ $t('profileNotesLabel') }}</label>
+        <textarea
+          v-model="form.notes"
+          rows="4"
+          class="profile-notes-textarea"
+          :placeholder="$t('profileNotesPlaceholder')"
+          spellcheck="false"
+          autocomplete="off"
+        ></textarea>
+        <div class="hint-text">{{ $t('profileNotesHint') }}</div>
+
         <label class="label-tiny">{{ $t('timezoneLabel') }}</label>
         <div class="timezone-wrapper">
           <input v-model="timezoneSearch" type="text" placeholder="Type to search or select..." autocomplete="off" @focus="openTimezoneList">
@@ -152,6 +163,7 @@ const form = reactive({
   tags: '',
   proxySource: 'custom',
   proxyId: '',
+  notes: '',
   proxyStr: '',
   timezone: 'Auto',
   city: null,
@@ -183,7 +195,11 @@ function parseBrowserVersionPreset(preset) {
 }
 
 // Searchable Dropdowns State
-const timezoneSearch = ref('Auto (No Change)');
+const AUTO_TIMEZONE_LABEL = 'Auto (IP Based)';
+const LEGACY_AUTO_TIMEZONE_LABEL = 'Auto (No Change)';
+const AUTO_CITY = { name: 'Auto (IP Based)', lat: null, lng: null };
+
+const timezoneSearch = ref(AUTO_TIMEZONE_LABEL);
 const showTimezoneList = ref(false);
 const citySearch = ref('Auto (IP Based)');
 const showCityList = ref(false);
@@ -192,7 +208,7 @@ const showLanguageList = ref(false);
 
 // Lists (Accessing from global window if not imported)
 const allTimezones = window.TIMEZONES || [];
-const allCities = window.CITY_DATA || [];
+const allCities = [AUTO_CITY, ...(window.CITY_DATA || [])];
 const allLanguages = window.LANGUAGE_DATA || [
   { name: 'Auto (System Default)', code: 'auto' },
   { name: 'English (US)', code: 'en-US' }
@@ -229,8 +245,9 @@ const filteredLanguages = computed(() => {
 });
 
 function selectTimezone(tz) {
-  form.timezone = tz === 'Auto (No Change)' ? 'Auto' : tz;
-  timezoneSearch.value = tz;
+  const isAuto = tz === AUTO_TIMEZONE_LABEL || tz === LEGACY_AUTO_TIMEZONE_LABEL || tz === 'Auto';
+  form.timezone = isAuto ? 'Auto' : tz;
+  timezoneSearch.value = isAuto ? AUTO_TIMEZONE_LABEL : tz;
   showTimezoneList.value = false;
 }
 
@@ -282,6 +299,7 @@ watch(() => uiStore.addModalVisible, async (newVal) => {
       tags: '',
       proxySource: 'custom',
       proxyId: '',
+      notes: '',
       proxyStr: '',
       timezone: 'Auto',
       city: null,
@@ -295,7 +313,7 @@ watch(() => uiStore.addModalVisible, async (newVal) => {
       browserVersionPreset: 'none',
       webglProfile: 'none'
     });
-    timezoneSearch.value = 'Auto (No Change)';
+    timezoneSearch.value = AUTO_TIMEZONE_LABEL;
     citySearch.value = 'Auto (IP Based)';
     languageSearch.value = 'Auto (System Default)';
     try {
@@ -358,6 +376,7 @@ async function handleSave() {
         proxyId: form.proxySource === 'managed' ? form.proxyId : null,
         proxyStr: form.proxySource === 'custom' ? proxyStr : (form.proxySource === 'direct' ? 'direct' : ''),
         tags,
+        notes: form.notes,
         timezone: form.timezone,
         city: form.city,
         geolocation: form.geolocation,
@@ -425,5 +444,10 @@ async function handleSave() {
 .mono-text {
   font-family: monospace;
   font-size: 11px;
+}
+
+.profile-notes-textarea {
+  min-height: 86px;
+  resize: vertical;
 }
 </style>
