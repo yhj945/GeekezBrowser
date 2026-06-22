@@ -1,5 +1,6 @@
 const { Base64 } = require('js-base64');
 const { URL } = require('url');
+const { buildXrayDnsConfig } = require('./dns-leak-protection');
 
 function decodeBase64Content(str) {
     try {
@@ -430,7 +431,19 @@ function applyUtlsFingerprint(outbound, utlsFingerprint) {
     }
 }
 
-function generateXrayConfig(mainProxyStr, localPort, preProxyConfig = null, profileFingerprint = null) {
+function applyXrayDnsDomainStrategy(outbound) {
+    if (!outbound || outbound.protocol === "freedom") return;
+    const streamSettings = outbound.streamSettings || {};
+    outbound.streamSettings = {
+        ...streamSettings,
+        sockopt: {
+            ...(streamSettings.sockopt || {}),
+            domainStrategy: "UseIPv4"
+        }
+    };
+}
+
+function generateXrayConfig(mainProxyStr, localPort, preProxyConfig = null, profileFingerprint = null, dnsLeakProtection = null) {
     const outbounds = [];
     const utlsFingerprint = deriveUtlsFingerprint(profileFingerprint || {});
     const mainOutbound = parseProxyLink(mainProxyStr, "proxy_main");
@@ -451,9 +464,9 @@ function generateXrayConfig(mainProxyStr, localPort, preProxyConfig = null, prof
     outbounds.push(mainOutbound);
     outbounds.push({ protocol: "freedom", tag: "direct" });
 
-    return {
+    const config = {
         log: { loglevel: "warning" },
-        inbounds: [{ 
+        inbounds: [{
             port: localPort, 
             listen: "127.0.0.1", 
             protocol: "socks", 
@@ -470,6 +483,14 @@ function generateXrayConfig(mainProxyStr, localPort, preProxyConfig = null, prof
             rules: [{ type: "field", outboundTag: "proxy_main", port: "0-65535" }]
         }
     };
+
+    const dnsConfig = buildXrayDnsConfig(dnsLeakProtection);
+    if (dnsConfig) {
+        config.dns = dnsConfig;
+        outbounds.forEach(applyXrayDnsDomainStrategy);
+    }
+
+    return config;
 }
 
 export { generateXrayConfig, parseProxyLink, getProxyRemark };

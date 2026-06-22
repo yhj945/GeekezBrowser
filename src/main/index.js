@@ -19,7 +19,8 @@ const { resolveXrayAssetName } = require('./xray-assets');
 const { normalizeProxyProbeTargets, shouldAcceptProbeStatus } = require('./proxy-probe-targets');
 const { normalizeProxyStartupHealthConfig } = require('./proxy-startup-health-config');
 const { isDirectProxy, normalizeProfileProxyFields, normalizeProfilePreProxyFields, normalizeOutboundProxyFields, resolveProfileProxy, resolveProfilePreProxy } = require('./profile-proxy');
-const { parseCustomLaunchArgs } = require('./launch-args');
+const { normalizeDnsLeakProtectionConfig, buildDnsLeakProtectionLaunchArgs, getDnsLeakProtectionDisabledFeatures } = require('./dns-leak-protection');
+const { filterManagedLaunchArgs, parseCustomLaunchArgs } = require('./launch-args');
 const gzip = promisify(zlib.gzip);
 const gunzip = promisify(zlib.gunzip);
 const initSqlJs = require('sql.js');
@@ -261,13 +262,14 @@ function normalizeLaunchOverrideArgs(input) {
     }
 
     const seen = new Set();
-    return flat.filter((arg) => {
+    const normalizedArgs = flat.filter((arg) => {
         const normalized = String(arg || '').trim();
         if (!normalized || !normalized.startsWith('--')) return false;
         if (seen.has(normalized)) return false;
         seen.add(normalized);
         return true;
     });
+    return filterManagedLaunchArgs(normalizedArgs);
 }
 
 function resolveApiLaunchOverrideArgs(params) {
@@ -683,7 +685,7 @@ function fetchTextWithRedirect(url, timeoutMs = 10000, redirectCount = 0) {
 
         const req = https.get(url, {
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36',
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
                 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
             }
         }, (res) => {
@@ -1126,7 +1128,7 @@ async function patchKnownExtensionOnboarding(extensionDir, storeId = '') {
 }
 
 function buildChromeStoreCrxUrl(extensionId) {
-    return `https://clients2.google.com/service/update2/crx?response=redirect&prodversion=147.0.0.0&acceptformat=crx2,crx3&x=id%3D${extensionId}%26installsource%3Dondemand%26uc`;
+    return `https://clients2.google.com/service/update2/crx?response=redirect&prodversion=149.0.0.0&acceptformat=crx2,crx3&x=id%3D${extensionId}%26installsource%3Dondemand%26uc`;
 }
 
 async function readSettingsForExtensionMutation() {
@@ -1150,6 +1152,7 @@ function normalizeSettingsSnapshot(settings) {
     Object.assign(nextSettings, normalizeOutboundProxyFields(nextSettings));
     nextSettings.proxyProbeUrls = String(nextSettings.proxyProbeUrls || '').trim();
     nextSettings.proxyStartupHealthCheck = normalizeProxyStartupHealthConfig(nextSettings);
+    nextSettings.dnsLeakProtection = normalizeDnsLeakProtectionConfig(nextSettings.dnsLeakProtection);
     nextSettings.lang = nextSettings.lang === 'en' ? 'en' : 'cn';
     nextSettings.enablePreProxy = !!nextSettings.enablePreProxy;
     nextSettings.notify = !!nextSettings.notify;
@@ -4816,7 +4819,7 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
             xrayLogPath = path.join(profileDir, 'xray_run.log');
             const upstreamProxy = useDirectNetwork ? activePreProxy?.url : resolvedProfileProxy.proxyStr;
             const chainedPreProxy = useDirectNetwork ? null : finalPreProxyConfig;
-            const config = generateXrayConfig(upstreamProxy, localPort, chainedPreProxy, profile.fingerprint);
+            const config = generateXrayConfig(upstreamProxy, localPort, chainedPreProxy, profile.fingerprint, settings.dnsLeakProtection);
             fs.writeJsonSync(xrayConfigPath, config);
             logFd = fs.openSync(xrayLogPath, 'a');
             const xrayLaunchStartedAt = Date.now();
@@ -4958,6 +4961,9 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
         if (process.platform === 'win32') {
             disabledFeatures.push('StartupLaunch', 'StartupBoost');
         }
+        if (localPort) {
+            disabledFeatures.push(...getDnsLeakProtectionDisabledFeatures(settings.dnsLeakProtection, { hasLocalProxy: true }));
+        }
 
         const launchArgs = [
             `--user-data-dir=${userDataDir}`,
@@ -4986,6 +4992,8 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
 
         if (localPort) {
             launchArgs.unshift(`--proxy-server=socks5://127.0.0.1:${localPort}`);
+            launchArgs.push('--disable-quic');
+            launchArgs.push(...buildDnsLeakProtectionLaunchArgs(settings.dnsLeakProtection, { hasLocalProxy: true }).filter(arg => arg !== '--disable-quic'));
         } else {
             launchArgs.unshift('--no-proxy-server');
         }

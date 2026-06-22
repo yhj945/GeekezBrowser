@@ -10,7 +10,7 @@ const RESOLUTIONS = [
     { w: 1440, h: 900 }
 ];
 
-const BROWSER_MAJOR_VERSIONS = Array.from({ length: 19 }, (_, i) => 129 + i); // 129 - 147
+const BROWSER_MAJOR_VERSIONS = Array.from({ length: 21 }, (_, i) => 129 + i); // 129 - 149
 const BROWSER_TYPES = ['chrome', 'edge'];
 const UTLS_SIGNATURES = [
     'none',
@@ -27,6 +27,8 @@ const UTLS_SIGNATURES = [
     'hellorandomizednoalpn'
 ];
 const BROWSER_FULL_VERSION_POOL = [
+    '149.0.0.0',
+    '148.0.0.0',
     '147.0.0.0',
     '146.0.0.0',
     '145.0.0.0',

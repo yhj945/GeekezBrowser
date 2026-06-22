@@ -10,8 +10,8 @@ export const browserTypeOptions = [
 
 export const browserMajorVersionOptions = [
     makeOption('auto', 'Auto Random', '自动随机'),
-    ...Array.from({ length: 19 }, (_, i) => {
-        const major = 147 - i;
+    ...Array.from({ length: 21 }, (_, i) => {
+        const major = 149 - i;
         return makeOption(major, `v${major}`, `v${major}`);
     })
 ];
@@ -19,8 +19,8 @@ export const browserMajorVersionOptions = [
 export const browserVersionPresetOptions = [
     makeOption('none', 'No UA Modification', '不修改 UA'),
     makeOption('auto', 'Auto Random', '自动随机'),
-    ...Array.from({ length: 19 }, (_, i) => {
-        const major = 147 - i;
+    ...Array.from({ length: 21 }, (_, i) => {
+        const major = 149 - i;
         return [
             makeOption(`chrome:${major}`, `Chrome v${major}`, `Chrome v${major}`),
             makeOption(`edge:${major}`, `Edge v${major}`, `Edge v${major}`)
