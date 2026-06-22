@@ -18,6 +18,23 @@
                 </label>
             </div>
 
+            <div style="display:flex; gap:8px; align-items:flex-start; margin-bottom:10px; flex-shrink:0;">
+                <textarea
+                    v-model="proxyStore.settings.proxyProbeUrls"
+                    rows="2"
+                    spellcheck="false"
+                    autocomplete="off"
+                    :placeholder="$t('proxyProbeUrlPlaceholder')"
+                    style="flex:1; min-height:52px; font-size:11px; margin:0;"
+                ></textarea>
+                <button class="outline" @click="proxyStore.saveSettings" style="font-size:11px; min-width:72px;">
+                    {{ $t('save') }}
+                </button>
+            </div>
+            <div style="font-size:10px; opacity:0.55; margin-top:-6px; margin-bottom:10px; flex-shrink:0;">
+                {{ $t('proxyProbeUrlHint') }}
+            </div>
+
             <div class="tab-header" style="flex-shrink:0;">
                 <div class="tab-btn no-drag" :class="{ active: proxyStore.currentGroup === 'manual' }" @click="proxyStore.switchGroup('manual')">
                     {{ $t('groupManual') }}
@@ -67,7 +84,7 @@
                             <span v-if="p.latency !== undefined" 
                                 class="proxy-latency" 
                                 :style="getLatencyStyle(p)"
-                                :title="p.latencyErr">
+                                :title="getLatencyTitle(p)">
                                 {{ getLatencyText(p) }}
                             </span>
                             <span v-else-if="proxyStore.testingIds.has(p.id)" class="proxy-latency" style="border:1px solid var(--text-secondary); opacity:0.5;">...</span>
@@ -183,7 +200,13 @@ const getNodeProto = (url) => {
 
 const getLatencyText = (node) => {
     if (node.latency === -1 || node.latency === 9999) return 'Fail';
-    return node.latency + 'ms';
+    const target = node.latencyTarget ? ` · ${node.latencyTarget}` : '';
+    return `${node.latency}ms${target}`;
+};
+
+const getLatencyTitle = (node) => {
+    if (node.latencyErr) return node.latencyErr;
+    return node.latencyTarget ? `Probe target: ${node.latencyTarget}` : '';
 };
 
 const getLatencyStyle = (node) => {

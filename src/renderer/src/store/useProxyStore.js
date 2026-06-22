@@ -2,17 +2,23 @@ import { defineStore } from 'pinia';
 import { ref, computed } from 'vue';
 import { ipcService } from '../services/ipc.service';
 import { proxyService } from '../services/proxy.service';
+import { profileService } from '../services/profile.service';
 import { getProxyRemark, uuidv4 } from '../utils/helpers';
 
 export const useProxyStore = defineStore('proxy', () => {
     // State
     const settings = ref({
         preProxies: [],
+        outboundProxies: [],
         subscriptions: [],
         mode: 'single',
         notify: false,
         selectedId: null,
-        enablePreProxy: false
+        enablePreProxy: false,
+        enableOutboundProxy: false,
+        outboundMode: 'single',
+        selectedOutboundId: null,
+        proxyProbeUrls: ''
     });
     const currentGroup = ref('manual');
     const testingIds = ref(new Set());
@@ -33,6 +39,8 @@ export const useProxyStore = defineStore('proxy', () => {
     });
 
     const manualNodes = computed(() => (settings.value.preProxies || []).filter(p => !p.groupId || p.groupId === 'manual'));
+    const usablePreProxyNodes = computed(() => (settings.value.preProxies || []).filter(node => node && node.enable !== false && String(node.url || '').trim()));
+    const outboundNodes = computed(() => settings.value.outboundProxies || []);
     const subscriptions = computed(() => settings.value.subscriptions || []);
 
     const proxyStatusText = computed(() => {
@@ -52,6 +60,41 @@ export const useProxyStore = defineStore('proxy', () => {
     const proxyStatusStyle = computed(() => {
         if (!settings.value.enablePreProxy) return { color: 'var(--text-secondary)', border: '1px solid var(--border)' };
         return { color: 'var(--accent)', border: '1px solid var(--accent)' };
+    });
+
+    const outboundStatusText = computed(() => {
+        if (!settings.value.enableOutboundProxy) return "OFF";
+        const mode = settings.value.outboundMode || 'single';
+        const usableNodes = (settings.value.outboundProxies || []).filter(p => p && p.enable !== false && String(p.url || '').trim());
+        const count = mode === 'single'
+            ? (usableNodes.some(p => p.id === settings.value.selectedOutboundId) ? 1 : 0)
+            : usableNodes.length;
+
+        let modeText = "";
+        if (mode === 'single') modeText = window.t ? window.t('modeSingle') : 'Single';
+        else if (mode === 'balance') modeText = window.t ? window.t('modeBalance') : 'Balance';
+        else modeText = window.t ? window.t('modeFailover') : 'Failover';
+
+        return `${modeText} [${count}]`;
+    });
+
+    const outboundStatusStyle = computed(() => {
+        if (!settings.value.enableOutboundProxy) return { color: 'var(--text-secondary)', border: '1px solid var(--border)' };
+        return { color: 'var(--accent)', border: '1px solid var(--accent)' };
+    });
+
+    const getActivePreProxyUrl = () => {
+        const nodes = settings.value.preProxies || [];
+        const activeNodes = nodes.filter(node => node && node.enable !== false && String(node.url || '').trim());
+        if (settings.value.mode === 'single') {
+            const selected = activeNodes.find(node => node.id === settings.value.selectedId);
+            return (selected || activeNodes[0])?.url || '';
+        }
+        return activeNodes[0]?.url || '';
+    };
+
+    const getProbeOptions = () => ({
+        proxyProbeUrls: settings.value.proxyProbeUrls || ''
     });
 
     const setTesting = (id, active) => {
@@ -91,9 +134,10 @@ export const useProxyStore = defineStore('proxy', () => {
 
         setTesting(id, true);
         try {
-            const res = await proxyService.testLatency(p.url);
+            const res = await proxyService.testLatency(p.url, getProbeOptions());
             p.latency = res.latency;
             p.latencyErr = res.error;
+            p.latencyTarget = res.target;
         } finally {
             setTesting(id, false);
         }
@@ -114,11 +158,12 @@ export const useProxyStore = defineStore('proxy', () => {
                 const node = list[index];
                 setTesting(node.id, true);
                 try {
-                    const res = await proxyService.testLatency(node.url);
+                    const res = await proxyService.testLatency(node.url, getProbeOptions());
                     const target = settings.value.preProxies.find(x => x.id === node.id);
                     if (target) {
                         target.latency = res.latency;
                         target.latencyErr = res.error;
+                        target.latencyTarget = res.target;
                     }
                 } finally {
                     setTesting(node.id, false);
@@ -141,6 +186,181 @@ export const useProxyStore = defineStore('proxy', () => {
     const deleteProxy = async (id) => {
         settings.value.preProxies = settings.value.preProxies.filter(p => p.id !== id);
         await saveSettings();
+    };
+
+    const findOutboundProxy = (id) => {
+        return (settings.value.outboundProxies || []).find(p => p.id === id);
+    };
+
+    const testOutboundLatency = async (id) => {
+        const p = findOutboundProxy(id);
+        if (!p) return;
+
+        setTesting(id, true);
+        try {
+            const res = await proxyService.testLatency(p.url, getProbeOptions());
+            p.latency = res.latency;
+            p.latencyErr = res.error;
+            p.latencyTarget = res.target;
+        } finally {
+            setTesting(id, false);
+        }
+    };
+
+    const testAllOutboundLatency = async () => {
+        const list = outboundNodes.value;
+        if (list.length === 0) return;
+
+        const concurrency = Math.min(6, Math.max(1, list.length));
+        let cursor = 0;
+
+        const worker = async () => {
+            while (true) {
+                const index = cursor++;
+                if (index >= list.length) return;
+                await testOutboundLatency(list[index].id);
+            }
+        };
+
+        await Promise.all(Array.from({ length: concurrency }, () => worker()));
+    };
+
+    const testOutboundChainLatency = async (id, preProxyUrl = getActivePreProxyUrl()) => {
+        const p = findOutboundProxy(id);
+        if (!p) return;
+
+        setTesting(`chain:${id}`, true);
+        try {
+            const res = await proxyService.testChainLatency(p.url, preProxyUrl, getProbeOptions());
+            p.chainLatency = res.latency;
+            p.chainLatencyErr = res.error;
+            p.chainLatencyTarget = res.target;
+        } finally {
+            setTesting(`chain:${id}`, false);
+        }
+    };
+
+    const testAllOutboundChainLatency = async (preProxyUrl = getActivePreProxyUrl()) => {
+        const list = outboundNodes.value;
+        if (list.length === 0) return;
+
+        const concurrency = Math.min(6, Math.max(1, list.length));
+        let cursor = 0;
+
+        const worker = async () => {
+            while (true) {
+                const index = cursor++;
+                if (index >= list.length) return;
+                await testOutboundChainLatency(list[index].id, preProxyUrl);
+            }
+        };
+
+        await Promise.all(Array.from({ length: concurrency }, () => worker()));
+    };
+
+    const getOutboundProxyReferences = async (id) => {
+        const profiles = await profileService.loadProfiles();
+        return (profiles || []).filter(profile => profile.proxySource === 'managed' && profile.proxyId === id);
+    };
+
+    const deleteOutboundProxy = async (id, options = {}) => {
+        if (!options.force) {
+            let refs;
+            try {
+                refs = await getOutboundProxyReferences(id);
+            } catch (error) {
+                return { success: false, error: error?.message || 'Failed to load profile references' };
+            }
+            if (refs.length > 0) {
+                return { success: false, referencedBy: refs };
+            }
+        }
+        const previousProxies = settings.value.outboundProxies || [];
+        const previousSelectedId = settings.value.selectedOutboundId;
+        const remaining = previousProxies.filter(p => p.id !== id);
+        settings.value.outboundProxies = remaining;
+        if (settings.value.selectedOutboundId === id) {
+            settings.value.selectedOutboundId = remaining.find(p => p.enable !== false && String(p.url || '').trim())?.id || null;
+        }
+        try {
+            await saveSettings();
+            return { success: true };
+        } catch (error) {
+            settings.value.outboundProxies = previousProxies;
+            settings.value.selectedOutboundId = previousSelectedId;
+            throw error;
+        }
+    };
+
+    const updateOutboundProxy = async (id, data) => {
+        const target = findOutboundProxy(id);
+        if (!target) return false;
+        const url = String(data?.url || '').trim();
+        if (!url) return false;
+
+        const previousUrl = target.url;
+        const previousRemark = target.remark;
+        target.url = url;
+        target.remark = String(data?.remark || '').trim() || getProxyRemark(url) || target.remark || 'Node';
+        try {
+            await saveSettings();
+            return true;
+        } catch (error) {
+            target.url = previousUrl;
+            target.remark = previousRemark;
+            throw error;
+        }
+    };
+
+    const batchAddOutboundProxy = async (text) => {
+        if (!text) return 0;
+        const lines = text.split('\n').map(l => l.trim()).filter(l => l);
+        if (lines.length === 0) return 0;
+
+        const newNodes = lines
+            .filter(line => line.includes('://') || line.includes(':'))
+            .map(line => ({
+                id: uuidv4(),
+                remark: getProxyRemark(line) || 'Outbound Node',
+                url: line,
+                enable: true
+            }));
+
+        if (newNodes.length === 0) return 0;
+        const previousProxies = settings.value.outboundProxies || [];
+        settings.value.outboundProxies = [...previousProxies, ...newNodes];
+        try {
+            await saveSettings();
+            return newNodes.length;
+        } catch (error) {
+            settings.value.outboundProxies = previousProxies;
+            throw error;
+        }
+    };
+
+    const toggleOutboundProxy = async (id) => {
+        const p = findOutboundProxy(id);
+        if (p) {
+            const previousEnable = p.enable;
+            p.enable = p.enable === false;
+            try {
+                await saveSettings();
+            } catch (error) {
+                p.enable = previousEnable;
+                throw error;
+            }
+        }
+    };
+
+    const selectOutboundProxy = async (id) => {
+        const previousId = settings.value.selectedOutboundId;
+        settings.value.selectedOutboundId = id;
+        try {
+            await saveSettings();
+        } catch (error) {
+            settings.value.selectedOutboundId = previousId;
+            throw error;
+        }
     };
 
     const toggleProxy = async (id) => {
@@ -235,15 +455,30 @@ export const useProxyStore = defineStore('proxy', () => {
         modes,
         currentGroupNodes,
         manualNodes,
+        usablePreProxyNodes,
+        outboundNodes,
         subscriptions,
         proxyStatusText,
         proxyStatusStyle,
+        outboundStatusText,
+        outboundStatusStyle,
+        getProbeOptions,
         loadSettings,
         saveSettings,
         switchGroup,
         testLatency,
         testCurrentGroup,
         deleteProxy,
+        testOutboundLatency,
+        testAllOutboundLatency,
+        testOutboundChainLatency,
+        testAllOutboundChainLatency,
+        getOutboundProxyReferences,
+        deleteOutboundProxy,
+        updateOutboundProxy,
+        batchAddOutboundProxy,
+        toggleOutboundProxy,
+        selectOutboundProxy,
         toggleProxy,
         selectProxy,
         syncSub,

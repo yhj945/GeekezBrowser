@@ -2,6 +2,16 @@ import { defineStore } from 'pinia';
 import { settingService } from '../services/setting.service';
 import { ipcService } from '../services/ipc.service';
 
+const EMPTY_PROXY_STARTUP_HEALTH_CHECK = {
+    readyTimeoutMs: null,
+    direct: {},
+    preProxy: {}
+};
+
+function cloneProxyStartupHealthCheck(value = EMPTY_PROXY_STARTUP_HEALTH_CHECK) {
+    return JSON.parse(JSON.stringify(value || EMPTY_PROXY_STARTUP_HEALTH_CHECK));
+}
+
 export const useSettingsStore = defineStore('settings', {
     state: () => ({
         enableRemoteDebugging: false,
@@ -16,6 +26,7 @@ export const useSettingsStore = defineStore('settings', {
         userExtensions: [],
         currentDataPath: '',
         isDefaultDataPath: true,
+        proxyStartupHealthCheck: cloneProxyStartupHealthCheck(),
         activeTab: 'extensions'
     }),
 
@@ -33,6 +44,7 @@ export const useSettingsStore = defineStore('settings', {
                 this.enableApiServer = settings.enableApiServer || false;
                 this.closeBehavior = settings.closeBehavior === 'quit' ? 'quit' : 'tray';
                 this.apiPort = settings.apiPort || 12138;
+                this.proxyStartupHealthCheck = cloneProxyStartupHealthCheck(settings.proxyStartupHealthCheck);
                 this.watermarkStyle = settings.watermarkStyle || 'enhanced';
                 localStorage.setItem('geekez_watermark_style', this.watermarkStyle);
 
@@ -138,6 +150,13 @@ export const useSettingsStore = defineStore('settings', {
             const settings = await ipcService.getSettings();
             settings.watermarkStyle = style;
             await ipcService.saveSettings(settings);
+        },
+
+        async saveProxyStartupHealthCheck(config) {
+            const settings = await ipcService.getSettings();
+            settings.proxyStartupHealthCheck = cloneProxyStartupHealthCheck(config);
+            await ipcService.saveSettings(settings);
+            await this.loadSettings();
         },
 
         async loadExtensions() {

@@ -282,6 +282,46 @@
                         </div>
                     </div>
 
+                    <!-- Proxy Startup Health Check Section -->
+                    <div style="margin-bottom: 25px;">
+                        <h4 style="margin-bottom:10px; color:var(--text-primary); font-size:14px;"
+                            data-i18n="proxyHealthTitle">{{ $t('proxyHealthTitle') }}</h4>
+                        <p style="font-size:12px; opacity:0.7; margin-bottom:15px;" data-i18n="proxyHealthDesc">
+                            {{ $t('proxyHealthDesc') }}
+                        </p>
+
+                        <div v-if="tempProxyStartupHealthCheck.direct && tempProxyStartupHealthCheck.preProxy"
+                            style="border:1px solid var(--border); border-radius:8px; padding:12px; background:rgba(0,0,0,0.12);">
+                            <label style="display:flex; flex-direction:column; gap:6px; margin-bottom:12px; font-size:12px; color:var(--text-secondary);">
+                                <span>{{ $t('proxyHealthReadyTimeoutMs') }}</span>
+                                <input type="number" min="1" max="30000" step="100"
+                                    v-model.number="tempProxyStartupHealthCheck.readyTimeoutMs"
+                                    style="max-width:220px; margin:0;">
+                            </label>
+
+                            <div v-for="phase in proxyHealthPhases" :key="phase.key" style="margin-top:12px;">
+                                <div style="font-size:12px; font-weight:600; color:var(--accent); margin-bottom:8px;">
+                                    {{ $t(phase.labelKey) }}
+                                </div>
+                                <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:10px;">
+                                    <label v-for="field in proxyHealthFields" :key="`${phase.key}-${field.key}`"
+                                        style="display:flex; flex-direction:column; gap:5px; font-size:11px; color:var(--text-secondary);">
+                                        <span>{{ $t(field.labelKey) }}</span>
+                                        <input type="number" min="1" max="30000" step="100"
+                                            v-model.number="tempProxyStartupHealthCheck[phase.key][field.key]"
+                                            style="margin:0; padding:7px 10px;">
+                                    </label>
+                                </div>
+                            </div>
+
+                            <div style="display:flex; justify-content:flex-end; margin-top:14px;">
+                                <button class="outline" @click="handleSaveProxyStartupHealthCheck" style="font-size:12px;">
+                                    {{ $t('save') }}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- Watermark Style Section -->
                     <div style="margin-bottom: 25px;">
                         <h4 style="margin-bottom:10px; color:var(--text-primary); font-size:14px;"
@@ -390,6 +430,11 @@ const uiStore = useUIStore();
 const settingsStore = useSettingsStore();
 
 const tempApiPort = ref(12138);
+const tempProxyStartupHealthCheck = ref({
+    readyTimeoutMs: null,
+    direct: {},
+    preProxy: {}
+});
 const showRestartWarning = ref(false);
 const showStoreSearch = ref(false);
 const storeSearchQuery = ref('');
@@ -401,6 +446,21 @@ const installingStoreId = ref('');
 const installProgressPercent = ref(0);
 const installProgressMessage = ref('');
 const scopeGroupState = ref({});
+
+const proxyHealthPhases = [
+    { key: 'direct', labelKey: 'proxyHealthDirectPhase' },
+    { key: 'preProxy', labelKey: 'proxyHealthPreProxyPhase' }
+];
+
+const proxyHealthFields = [
+    { key: 'warmupMs', labelKey: 'proxyHealthWarmupMs' },
+    { key: 'fastReadyTimeoutMs', labelKey: 'proxyHealthFastReadyTimeoutMs' },
+    { key: 'fastProbeTimeoutMs', labelKey: 'proxyHealthFastProbeTimeoutMs' },
+    { key: 'slowReadyTimeoutMs', labelKey: 'proxyHealthSlowReadyTimeoutMs' },
+    { key: 'slowProbeTimeoutMs', labelKey: 'proxyHealthSlowProbeTimeoutMs' }
+];
+
+const cloneProxyStartupHealthCheck = (value) => JSON.parse(JSON.stringify(value || {}));
 
 onMounted(async () => {
     settingService.onExtensionInstallProgress((payload) => {
@@ -421,6 +481,10 @@ onMounted(async () => {
 watch(() => settingsStore.apiPort, (newVal) => {
     tempApiPort.value = newVal;
 }, { immediate: true });
+
+watch(() => settingsStore.proxyStartupHealthCheck, (newVal) => {
+    tempProxyStartupHealthCheck.value = cloneProxyStartupHealthCheck(newVal);
+}, { immediate: true, deep: true });
 
 const handleSelectExtension = async () => {
     const path = await settingService.selectExtensionFolder();
@@ -608,6 +672,11 @@ const handleSaveApiPort = async () => {
     }
     await settingsStore.saveApiPort(tempApiPort.value);
     uiStore.showAlert(window.t('apiPortSaved'));
+};
+
+const handleSaveProxyStartupHealthCheck = async () => {
+    await settingsStore.saveProxyStartupHealthCheck(tempProxyStartupHealthCheck.value);
+    uiStore.showAlert(window.t('proxyHealthSaved'));
 };
 
 const handleOpenApiDocs = () => {

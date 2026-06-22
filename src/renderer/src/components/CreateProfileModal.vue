@@ -14,7 +14,7 @@
 
         <label class="label-tiny">{{ $t('timezoneLabel') }}</label>
         <div class="timezone-wrapper">
-          <input v-model="timezoneSearch" type="text" placeholder="Type to search or select..." autocomplete="off" @focus="showTimezoneList = true">
+          <input v-model="timezoneSearch" type="text" placeholder="Type to search or select..." autocomplete="off" @focus="openTimezoneList">
           <div v-if="showTimezoneList" class="timezone-dropdown active">
             <div v-for="tz in filteredTimezones" :key="tz" class="timezone-item" @click="selectTimezone(tz)">
               {{ tz }}
@@ -22,9 +22,32 @@
           </div>
         </div>
 
-        <label class="label-tiny">{{ $t('proxyLink') }}</label>
-        <textarea v-model="form.proxyStr" rows="4" placeholder="vmess://, ss://... (one per line for batch)" spellcheck="false" autocomplete="off"></textarea>
-        <div class="hint-text">{{ $t('batchHint') }}</div>
+        <label class="label-tiny">{{ $t('proxySourceLabel') }}</label>
+        <select v-model="form.proxySource">
+          <option value="global">{{ $t('proxySourceGlobal') }}</option>
+          <option value="managed">{{ $t('proxySourceManaged') }}</option>
+          <option value="custom">{{ $t('proxySourceCustom') }}</option>
+          <option value="direct">{{ $t('proxySourceDirect') }}</option>
+        </select>
+
+        <template v-if="form.proxySource === 'custom'">
+          <label class="label-tiny">{{ $t('proxyLink') }}</label>
+          <textarea v-model="form.proxyStr" rows="4" placeholder="vmess://, ss://... (one per line for batch)" spellcheck="false" autocomplete="off"></textarea>
+          <div class="hint-text">{{ $t('batchHint') }}</div>
+        </template>
+
+        <template v-if="form.proxySource === 'managed'">
+          <label class="label-tiny">{{ $t('managedProxyLabel') }}</label>
+          <select v-model="form.proxyId">
+            <option value="">{{ $t('selectManagedProxy') }}</option>
+            <option v-for="node in managedProxyNodes" :key="node.id" :value="node.id">
+              {{ node.remark || node.name || node.id }}
+            </option>
+          </select>
+        </template>
+
+        <div v-if="form.proxySource === 'global'" class="hint-text">{{ $t('globalProxyHint') }}</div>
+        <div v-if="form.proxySource === 'direct'" class="hint-text">{{ $t('directProxyHint') }}</div>
 
         <div class="flex-row">
           <div class="flex-1">
@@ -33,6 +56,12 @@
               <option value="default">{{ $t('optDefault') }}</option>
               <option value="on">{{ $t('optOn') }}</option>
               <option value="off">{{ $t('optOff') }}</option>
+            </select>
+            <select v-if="form.preProxyOverride !== 'off'" v-model="form.preProxyId">
+              <option value="">{{ $t('preProxyUseGlobal') }}</option>
+              <option v-for="node in availablePreProxyNodes" :key="node.id" :value="node.id">
+                {{ node.remark || node.name || node.id }}
+              </option>
             </select>
           </div>
           <div class="flex-1">
@@ -46,7 +75,7 @@
 
         <label class="label-tiny mt-10">{{ $t('locationLabel') }}</label>
         <div class="timezone-wrapper">
-          <input v-model="citySearch" type="text" placeholder="Type to search city..." autocomplete="off" @focus="showCityList = true">
+          <input v-model="citySearch" type="text" placeholder="Type to search city..." autocomplete="off" @focus="openCityList">
           <div v-if="showCityList" class="timezone-dropdown active">
             <div v-for="city in filteredCities" :key="city.name" class="timezone-item" @click="selectCity(city)">
               {{ city.name }}
@@ -57,7 +86,7 @@
 
         <label class="label-tiny mt-10">{{ $t('languageLabel') }}</label>
         <div class="timezone-wrapper">
-          <input v-model="languageSearch" type="text" placeholder="Type to search language..." autocomplete="off" @focus="showLanguageList = true">
+          <input v-model="languageSearch" type="text" placeholder="Type to search language..." autocomplete="off" @focus="openLanguageList">
           <div v-if="showLanguageList" class="timezone-dropdown active">
             <div v-for="lang in filteredLanguages" :key="lang.code" class="timezone-item" @click="selectLanguage(lang)">
               {{ lang.name }} ({{ lang.code }})
@@ -115,15 +144,20 @@ const profileStore = useProfileStore();
 const isSaving = ref(false);
 const settings = ref({});
 const showUaWebglModify = ref(false);
+const managedProxyNodes = computed(() => (settings.value.outboundProxies || []).filter(node => String(node.url || '').trim() && node.enable !== false));
+const availablePreProxyNodes = computed(() => (settings.value.preProxies || []).filter(node => String(node.url || '').trim() && node.enable !== false));
 
 const form = reactive({
   name: '',
   tags: '',
+  proxySource: 'custom',
+  proxyId: '',
   proxyStr: '',
   timezone: 'Auto',
-  city: 'Auto (IP Based)',
+  city: null,
   language: 'auto',
   preProxyOverride: 'default',
+  preProxyId: '',
   resW: null,
   resH: null,
   geolocation: null,
@@ -163,6 +197,21 @@ const allLanguages = window.LANGUAGE_DATA || [
   { name: 'Auto (System Default)', code: 'auto' },
   { name: 'English (US)', code: 'en-US' }
 ];
+
+function openTimezoneList() {
+  if (timezoneSearch.value === 'Auto (No Change)') timezoneSearch.value = '';
+  showTimezoneList.value = true;
+}
+
+function openCityList() {
+  if (citySearch.value === 'Auto (IP Based)') citySearch.value = '';
+  showCityList.value = true;
+}
+
+function openLanguageList() {
+  if (languageSearch.value === 'Auto (System Default)') languageSearch.value = '';
+  showLanguageList.value = true;
+}
 
 const filteredTimezones = computed(() => {
   const s = timezoneSearch.value.toLowerCase();
@@ -204,26 +253,41 @@ function selectLanguage(lang) {
   showLanguageList.value = false;
 }
 
+function restoreCommittedSearchText() {
+  timezoneSearch.value = form.timezone === 'Auto' ? 'Auto (No Change)' : form.timezone;
+  citySearch.value = form.city || 'Auto (IP Based)';
+  const langObj = allLanguages.find(l => l.code === form.language);
+  languageSearch.value = langObj ? langObj.name : 'Auto (System Default)';
+}
+
 // Global click to close dropdowns
 function handleGlobalClick(e) {
   if (!e.target.closest('.timezone-wrapper')) {
     showTimezoneList.value = false;
     showCityList.value = false;
     showLanguageList.value = false;
+    restoreCommittedSearchText();
   }
 }
 
 // Watch for modal open to reset form
+watch(() => form.preProxyOverride, (newVal) => {
+  if (newVal === 'off') form.preProxyId = '';
+});
+
 watch(() => uiStore.addModalVisible, async (newVal) => {
   if (newVal) {
     Object.assign(form, {
       name: '',
       tags: '',
+      proxySource: 'custom',
+      proxyId: '',
       proxyStr: '',
       timezone: 'Auto',
-      city: 'Auto (IP Based)',
+      city: null,
       language: 'auto',
       preProxyOverride: 'default',
+      preProxyId: '',
       resW: null,
       resH: null,
       geolocation: null,
@@ -253,9 +317,15 @@ onUnmounted(() => {
 });
 
 async function handleSave() {
-  const proxyLines = form.proxyStr.split('\n').map(l => l.trim()).filter(l => l);
-  if (proxyLines.length === 0) {
+  const proxyLines = form.proxySource === 'custom'
+    ? form.proxyStr.split('\n').map(l => l.trim()).filter(l => l)
+    : [form.proxySource === 'direct' ? 'direct' : ''];
+  if (form.proxySource === 'custom' && proxyLines.length === 0) {
     uiStore.showAlert(window.t('inputReq'));
+    return;
+  }
+  if (form.proxySource === 'managed' && !form.proxyId) {
+    uiStore.showAlert(window.t?.('proxyRequiredMsg') || '请选择或填写代理链接');
     return;
   }
 
@@ -284,7 +354,9 @@ async function handleSave() {
 
       const payload = {
         name,
-        proxyStr,
+        proxySource: form.proxySource,
+        proxyId: form.proxySource === 'managed' ? form.proxyId : null,
+        proxyStr: form.proxySource === 'custom' ? proxyStr : (form.proxySource === 'direct' ? 'direct' : ''),
         tags,
         timezone: form.timezone,
         city: form.city,
@@ -293,6 +365,7 @@ async function handleSave() {
         screen,
         uaMode: browserPreset.uaMode,
         preProxyOverride: form.preProxyOverride,
+        preProxyId: form.preProxyOverride === 'off' ? null : (form.preProxyId || null),
         customArgs: form.customArgs,
         browserType: browserPreset.browserType,
         browserMajorVersion: browserPreset.browserMajorVersion,

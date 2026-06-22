@@ -60,7 +60,7 @@ function parseProxyLink(link, tag) {
             if (vmess.tls === 'tls') {
                 outbound.streamSettings.tlsSettings = {
                     serverName: vmess.sni || vmess.host,
-                    fingerprint: "chrome",
+                    fingerprint: vmess.fp || undefined,
                     allowInsecure: true,
                     alpn: vmess.alpn ? vmess.alpn.split(',') : undefined
                 };
@@ -107,14 +107,14 @@ function parseProxyLink(link, tag) {
             if (security === 'tls') {
                 outbound.streamSettings.tlsSettings = {
                     serverName: params.get("sni") || params.get("host") || urlObj.hostname,
-                    fingerprint: params.get("fp") || "chrome",
+                    fingerprint: params.get("fp") || undefined,
                     allowInsecure: true,
                     alpn: params.get("alpn") ? params.get("alpn").split(',') : undefined
                 };
             } else if (security === 'reality') {
                 outbound.streamSettings.realitySettings = {
                     show: false,
-                    fingerprint: params.get("fp") || "chrome",
+                    fingerprint: params.get("fp") || undefined,
                     serverName: params.get("sni") || params.get("host") || "",
                     publicKey: params.get("pbk") || "",
                     shortId: params.get("sid") || "",
@@ -132,7 +132,7 @@ function parseProxyLink(link, tag) {
             outbound.streamSettings = {
                 network: type,
                 security: params.get("security") || "tls",
-                tlsSettings: { serverName: params.get("sni") || urlObj.hostname, fingerprint: "chrome", allowInsecure: true },
+                tlsSettings: { serverName: params.get("sni") || urlObj.hostname, fingerprint: params.get("fp") || undefined, allowInsecure: true },
                 wsSettings: type === 'ws' ? { path: params.get("path"), headers: { Host: params.get("host") } } : undefined,
                 grpcSettings: type === 'grpc' ? { serviceName: params.get("serviceName") } : undefined
             };
@@ -384,12 +384,21 @@ function parseProxyLink(link, tag) {
             outbound.protocol = "http";
             outbound.settings = { servers: [{ address: urlObj.hostname, port: parseInt(urlObj.port), users: urlObj.username ? [{ user: urlObj.username, pass: urlObj.password }] : [] }] };
         } else { throw new Error("Unsupported protocol"); }
-    } catch (e) { console.error("Parse Proxy Error:", link, e); throw e; }
+    } catch (e) {
+        const rawLink = String(link || '');
+        const schemeMatch = rawLink.match(/^([a-z][a-z0-9+.-]*):\/\//i);
+        const protocol = schemeMatch ? schemeMatch[1].toLowerCase() : 'unknown';
+        const message = String(e?.message || String(e)).replace(rawLink, '[redacted proxy]');
+        console.error("Parse Proxy Error:", { tag, protocol, message });
+        const sanitizedError = new Error(message);
+        if (e?.code) sanitizedError.code = e.code;
+        throw sanitizedError;
+    }
     return outbound;
 }
 
 function deriveUtlsFingerprint(profileFingerprint = {}) {
-    if (profileFingerprint.uaMode === 'none') return '';
+    if (profileFingerprint.uaMode === 'none') return 'chrome';
 
     const browserType = String(profileFingerprint.browserType || '').toLowerCase();
     const major = Number(profileFingerprint.browserMajorVersion) || 0;
@@ -412,12 +421,12 @@ function applyUtlsFingerprint(outbound, utlsFingerprint) {
     const stream = outbound.streamSettings;
     if (stream.security === 'tls') {
         if (!stream.tlsSettings) stream.tlsSettings = {};
-        stream.tlsSettings.fingerprint = utlsFingerprint;
+        if (!stream.tlsSettings.fingerprint) stream.tlsSettings.fingerprint = utlsFingerprint;
     }
 
     if (stream.security === 'reality') {
         if (!stream.realitySettings) stream.realitySettings = {};
-        stream.realitySettings.fingerprint = utlsFingerprint;
+        if (!stream.realitySettings.fingerprint) stream.realitySettings.fingerprint = utlsFingerprint;
     }
 }
 
@@ -428,13 +437,15 @@ function generateXrayConfig(mainProxyStr, localPort, preProxyConfig = null, prof
     applyUtlsFingerprint(mainOutbound, utlsFingerprint);
 
     if (preProxyConfig && preProxyConfig.preProxies && preProxyConfig.preProxies.length > 0) {
-        try {
-            const target = preProxyConfig.preProxies[0];
-            const preOutbound = parseProxyLink(target.url, "proxy_pre");
-            applyUtlsFingerprint(preOutbound, utlsFingerprint);
-            outbounds.push(preOutbound);
-            mainOutbound.proxySettings = { tag: "proxy_pre" };
-        } catch (e) { }
+        const target = preProxyConfig.preProxies[0];
+        const preOutbound = parseProxyLink(target.url, "proxy_pre");
+        applyUtlsFingerprint(preOutbound, utlsFingerprint);
+        if (!mainOutbound.streamSettings) mainOutbound.streamSettings = {};
+        mainOutbound.streamSettings.sockopt = {
+            ...(mainOutbound.streamSettings.sockopt || {}),
+            dialerProxy: "proxy_pre"
+        };
+        outbounds.push(preOutbound);
     }
 
     outbounds.push(mainOutbound);
