@@ -18,6 +18,7 @@
 
     <!-- Other Modals (Legacy wrapper components) -->
     <ProxyModal />
+    <OutboundProxyModal />
     <SettingsModal :class="{ active: uiStore.settingsModalVisible }" />
     <HelpModal :class="{ active: uiStore.helpModalVisible }" />
     <ExportModal :class="{ active: uiStore.exportModalVisible }" />
@@ -43,6 +44,7 @@ import ProfileList from './components/ProfileList.vue';
 import CreateProfileModal from './components/CreateProfileModal.vue';
 import EditProfileModal from './components/EditProfileModal.vue';
 import ProxyModal from './components/ProxyModal.vue';
+import OutboundProxyModal from './components/OutboundProxyModal.vue';
 import ExportModal from './components/ExportModal.vue';
 import ExportSelectModal from './components/ExportSelectModal.vue';
 import PasswordModal from './components/PasswordModal.vue';

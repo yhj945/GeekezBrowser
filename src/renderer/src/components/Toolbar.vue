@@ -1,15 +1,25 @@
 <template>
     <div>
-    <div class="toolbar">
-        <div style="display:flex; gap:15px; align-items:center;">
-            <label style="font-size:13px; cursor:pointer; display:flex; align-items:center; gap:8px;">
-                <input type="checkbox" v-model="proxyStore.settings.enablePreProxy" @change="handlePreProxyToggle" style="width:auto; margin:0;"> 
-                <span data-i18n="enablePreProxy">{{ $t('enablePreProxy') }}</span>
-            </label>
-            <span class="status-badge" :style="proxyStore.proxyStatusStyle">{{ proxyStore.proxyStatusText }}</span>
-            <button class="outline" @click="openProxyManager">{{ $t('manageChain') }}</button>
+    <div class="toolbar toolbar-layout">
+        <div class="proxy-controls-stack">
+            <div class="proxy-control-row">
+                <label class="proxy-toggle-label">
+                    <input type="checkbox" v-model="proxyStore.settings.enablePreProxy" @change="handlePreProxyToggle" style="width:auto; margin:0;">
+                    <span data-i18n="enablePreProxy">{{ $t('enablePreProxy') }}</span>
+                </label>
+                <span class="status-badge" :style="proxyStore.proxyStatusStyle">{{ proxyStore.proxyStatusText }}</span>
+                <button class="outline" @click="openProxyManager">{{ $t('manageChain') }}</button>
+            </div>
+            <div class="proxy-control-row">
+                <label class="proxy-toggle-label">
+                    <input type="checkbox" v-model="proxyStore.settings.enableOutboundProxy" @change="handleOutboundProxyToggle" style="width:auto; margin:0;">
+                    <span>{{ $t('enableOutboundProxy') }}</span>
+                </label>
+                <span class="status-badge" :style="proxyStore.outboundStatusStyle">{{ proxyStore.outboundStatusText }}</span>
+                <button class="outline" @click="openOutboundProxyManager">{{ $t('manageOutboundProxy') }}</button>
+            </div>
         </div>
-        <div style="display:flex; gap:10px;">
+        <div class="toolbar-actions">
             <button class="outline" @click="openExportModal">{{ $t('btnExport') }}</button>
             <div style="position: relative;">
                 <button class="outline" @click="toggleImportMenu" id="importBtn">{{ $t('importYaml') }} ▾</button>
@@ -100,6 +110,10 @@ const openProxyManager = () => {
   uiStore.openProxyManager();
 };
 
+const openOutboundProxyManager = () => {
+  uiStore.openOutboundProxyManager();
+};
+
 const handlePreProxyToggle = async () => {
     const enabled = !!proxyStore.settings.enablePreProxy;
     try {
@@ -110,6 +124,19 @@ const handlePreProxyToggle = async () => {
     } catch (e) {
         proxyStore.settings.enablePreProxy = !enabled;
         uiStore.showAlert((window.t?.('preProxySaveFailed') || '保存前置代理设置失败：') + (e?.message || e));
+    }
+};
+
+const handleOutboundProxyToggle = async () => {
+    const enabled = !!proxyStore.settings.enableOutboundProxy;
+    try {
+        await proxyStore.saveSettings();
+        uiStore.showAlert(enabled
+            ? (window.t?.('outboundProxyEnabledMsg') || '出口代理已开启')
+            : (window.t?.('outboundProxyDisabledMsg') || '出口代理已关闭'));
+    } catch (e) {
+        proxyStore.settings.enableOutboundProxy = !enabled;
+        uiStore.showAlert((window.t?.('outboundProxySaveFailed') || '保存出口代理设置失败：') + (e?.message || e));
     }
 };
 
@@ -232,3 +259,33 @@ onMounted(() => {
     proxyStore.loadSettings();
 });
 </script>
+
+<style scoped>
+.toolbar-layout {
+    align-items: flex-start;
+    gap: 15px;
+}
+
+.proxy-controls-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.proxy-control-row,
+.toolbar-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.proxy-toggle-label {
+    font-size: 13px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 120px;
+}
+</style>

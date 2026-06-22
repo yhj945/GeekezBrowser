@@ -7,6 +7,7 @@ export const useUIStore = defineStore('ui', () => {
     const addModalVisible = ref(false);
     const editModalVisible = ref(false);
     const proxyModalVisible = ref(false);
+    const outboundProxyModalVisible = ref(false);
     const exportModalVisible = ref(false);
     const settingsModalVisible = ref(false);
     const helpModalVisible = ref(false);
@@ -89,6 +90,8 @@ export const useUIStore = defineStore('ui', () => {
 
     const openProxyManager = () => { proxyModalVisible.value = true; };
     const closeProxyManager = () => { proxyModalVisible.value = false; };
+    const openOutboundProxyManager = () => { outboundProxyModalVisible.value = true; };
+    const closeOutboundProxyManager = () => { outboundProxyModalVisible.value = false; };
 
     const openSettings = () => { settingsModalVisible.value = true; };
     const closeSettings = () => { settingsModalVisible.value = false; };
@@ -181,6 +184,7 @@ export const useUIStore = defineStore('ui', () => {
         addModalVisible,
         editModalVisible,
         proxyModalVisible,
+        outboundProxyModalVisible,
         exportModalVisible,
         settingsModalVisible,
         helpModalVisible,
@@ -215,6 +219,8 @@ export const useUIStore = defineStore('ui', () => {
         closeExportSelectModal,
         openProxyManager,
         closeProxyManager,
+        openOutboundProxyManager,
+        closeOutboundProxyManager,
         openSettings,
         closeSettings,
         setTheme,

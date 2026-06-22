@@ -16,6 +16,10 @@ const { getChromiumPath: resolveChromiumPathForApp } = require('./chromium-path'
 const { CLOSE_BEHAVIOR, normalizeCloseBehavior, resolveCloseBehavior } = require('./close-behavior');
 const { fetchLatestGitHubReleaseInfo } = require('./release-check');
 const { resolveXrayAssetName } = require('./xray-assets');
+const { normalizeProxyProbeTargets, shouldAcceptProbeStatus } = require('./proxy-probe-targets');
+const { normalizeProxyStartupHealthConfig } = require('./proxy-startup-health-config');
+const { isDirectProxy, normalizeProfileProxyFields, normalizeProfilePreProxyFields, normalizeOutboundProxyFields, resolveProfileProxy, resolveProfilePreProxy } = require('./profile-proxy');
+const { parseCustomLaunchArgs } = require('./launch-args');
 const gzip = promisify(zlib.gzip);
 const gunzip = promisify(zlib.gunzip);
 const initSqlJs = require('sql.js');
@@ -65,7 +69,7 @@ async function createSocksProxyAgent(proxyUrl) {
 // Only disable if GPU compatibility issues occur
 
 import { generateXrayConfig, parseProxyLink, getProxyRemark } from './utils';
-import { generateFingerprint, getInjectScript, getWatermarkScript } from './fingerprint';
+import { generateFingerprint, getInjectScript, getWorkerInjectScript, getWatermarkScript, ensureProfileScopedNoiseSeed, rotateProfileNoiseSeed, buildCanvasFingerprintPreview } from './fingerprint';
 
 const isDev = !app.isPackaged;
 const RESOURCES_BIN = isDev ? path.join(app.getAppPath(), 'resources', 'bin') : path.join(process.resourcesPath, 'bin');
@@ -1136,19 +1140,18 @@ async function saveSettingsWithNormalizedExtensions(settings) {
 function normalizeSettingsSnapshot(settings) {
     const nextSettings = settings || {};
     if (!Array.isArray(nextSettings.preProxies)) nextSettings.preProxies = [];
+    if (!Array.isArray(nextSettings.outboundProxies)) nextSettings.outboundProxies = [];
     if (!Array.isArray(nextSettings.subscriptions)) nextSettings.subscriptions = [];
     if (!['single', 'balance', 'failover'].includes(nextSettings.mode)) nextSettings.mode = 'single';
+    Object.assign(nextSettings, normalizeOutboundProxyFields(nextSettings));
+    nextSettings.proxyProbeUrls = String(nextSettings.proxyProbeUrls || '').trim();
+    nextSettings.proxyStartupHealthCheck = normalizeProxyStartupHealthConfig(nextSettings);
     nextSettings.lang = nextSettings.lang === 'en' ? 'en' : 'cn';
     nextSettings.enablePreProxy = !!nextSettings.enablePreProxy;
     nextSettings.notify = !!nextSettings.notify;
     nextSettings.userExtensions = normalizeUserExtensions(nextSettings.userExtensions || []);
     nextSettings.closeBehavior = normalizeCloseBehavior(nextSettings.closeBehavior);
     return nextSettings;
-}
-
-function isDirectProxy(proxyStr) {
-    const value = String(proxyStr || '').trim().toLowerCase();
-    return value === 'direct' || value === 'direct://';
 }
 
 function ensureProxyStrValid(proxyStr) {
@@ -1283,6 +1286,7 @@ function normalizeFingerprintOptions(data = {}) {
         canvasNoise: firstDefined(data.canvasNoise, inputFp.canvasNoise),
         audioNoise: firstDefined(data.audioNoise, inputFp.audioNoise),
         noiseSeed: firstDefined(data.noiseSeed, inputFp.noiseSeed),
+        noiseSeedProfileId: firstDefined(data.noiseSeedProfileId, inputFp.noiseSeedProfileId),
         browserType: firstDefined(data.browserType, inputFp.browserType),
         browserMajorVersion: firstDefined(data.browserMajorVersion, inputFp.browserMajorVersion),
         browserFullVersion: firstDefined(data.browserFullVersion, inputFp.browserFullVersion),
@@ -1353,10 +1357,14 @@ async function buildProfileFromInput(rawData, profiles, settings, existingProfil
     const uniqueName = existingProfile && baseName === existingProfile.name
         ? existingProfile.name
         : buildUniqueProfileName(profiles, baseName);
-    const proxyStr = firstDefined(data.proxyStr, existingProfile?.proxyStr, '') || '';
-    const proxyChanged = !existingProfile || (hasOwn(data, 'proxyStr') && proxyStr !== (existingProfile?.proxyStr || ''));
-    if (proxyChanged) {
-        ensureProxyStrValid(proxyStr);
+    const profileId = existingProfile?.id || uuidv4();
+    const proxyFields = normalizeProfileProxyFields(data, existingProfile);
+    const preProxyFields = normalizeProfilePreProxyFields(data, existingProfile);
+    const proxyToValidate = proxyFields.proxySource === 'managed'
+        ? resolveProfileProxy(proxyFields, settings).proxyStr
+        : proxyFields.proxyStr;
+    if (proxyFields.proxySource !== 'global') {
+        ensureProxyStrValid(proxyToValidate);
     }
 
     const incomingFingerprint = data.fingerprint && typeof data.fingerprint === 'object' ? data.fingerprint : {};
@@ -1415,7 +1423,15 @@ async function buildProfileFromInput(rawData, profiles, settings, existingProfil
         }
     }
 
-    const fingerprint = normalizeFingerprint(mergedFingerprintSource);
+    const normalizedFingerprint = normalizeFingerprint(mergedFingerprintSource);
+    const rotateNoiseSeed = data.rotateNoiseSeed === true || incomingFingerprint.rotateNoiseSeed === true;
+    delete normalizedFingerprint.rotateNoiseSeed;
+    const fingerprint = rotateNoiseSeed
+        ? rotateProfileNoiseSeed(normalizedFingerprint, profileId)
+        : ensureProfileScopedNoiseSeed(normalizedFingerprint, profileId, {
+            deriveOnMissingProfileId: !existingProfile,
+            deriveOnProfileMismatch: !existingProfile
+        });
     const debugPort = await allocateDebugPortIfNeeded(settings, profiles, firstDefined(data.debugPort, existingProfile?.debugPort));
     const normalizedCustomArgs = hasOwn(data, 'args')
         ? normalizeStoredCustomArgs(data.args, existingProfile?.customArgs || '')
@@ -1423,12 +1439,15 @@ async function buildProfileFromInput(rawData, profiles, settings, existingProfil
 
     return {
         ...(existingProfile || {}),
-        id: existingProfile?.id || uuidv4(),
+        id: profileId,
         name: uniqueName,
-        proxyStr,
+        proxySource: proxyFields.proxySource,
+        proxyId: proxyFields.proxyId,
+        proxyStr: proxyFields.proxyStr,
         tags: normalizeTags(firstDefined(data.tags, existingProfile?.tags, [])),
         fingerprint,
-        preProxyOverride: firstDefined(data.preProxyOverride, existingProfile?.preProxyOverride, 'default'),
+        preProxyOverride: preProxyFields.preProxyOverride,
+        preProxyId: preProxyFields.preProxyId,
         debugPort,
         customArgs: normalizedCustomArgs,
         isSetup: existingProfile?.isSetup || false,
@@ -1604,6 +1623,7 @@ async function handleApiRequest(method, pathname, body, params, context = {}) {
             createdAt: Date.now(),
             profiles: profiles.map(p => ({ ...p, fingerprint: cleanFingerprint ? cleanFingerprint(p.fingerprint) : p.fingerprint })),
             preProxies: settings.preProxies || [],
+            outboundProxies: settings.outboundProxies || [],
             subscriptions: settings.subscriptions || [],
             browserData: {}
         };
@@ -1663,13 +1683,17 @@ async function handleApiRequest(method, pathname, body, params, context = {}) {
 
     // GET /api/export/fingerprint - Export YAML fingerprints
     if (method === 'GET' && pathname === '/api/export/fingerprint') {
-        const exportData = profiles.map(p => ({
-            id: p.id,
-            name: p.name,
-            proxyStr: p.proxyStr,
-            tags: p.tags,
-            fingerprint: cleanFingerprint ? cleanFingerprint(p.fingerprint) : p.fingerprint
-        }));
+        const exportData = {
+            profiles: profiles.map(p => ({
+                id: p.id,
+                name: p.name,
+                proxySource: p.proxySource,
+                proxyId: p.proxyId,
+                proxyStr: p.proxyStr,
+                tags: p.tags,
+                fingerprint: cleanFingerprint ? cleanFingerprint(p.fingerprint) : p.fingerprint
+            }))
+        };
         const yamlStr = yaml.dump(exportData, { lineWidth: -1, noRefs: true });
         return {
             success: true,
@@ -1691,13 +1715,16 @@ async function handleApiRequest(method, pathname, body, params, context = {}) {
             // Try YAML first
             try {
                 const yamlData = yaml.load(content);
-                if (Array.isArray(yamlData)) {
+                const yamlProfiles = Array.isArray(yamlData) ? yamlData : (Array.isArray(yamlData?.profiles) ? yamlData.profiles : null);
+                if (yamlProfiles) {
                     let imported = 0;
-                    for (const item of yamlData) {
+                    for (const item of yamlProfiles) {
                         const name = generateUniqueName(item.name || `Imported-${Date.now()}`);
                         const newProfile = {
                             id: uuidv4(),
                             name,
+                            proxySource: item.proxySource || (isDirectProxy(item.proxyStr) ? 'direct' : 'custom'),
+                            proxyId: item.proxyId || null,
                             proxyStr: item.proxyStr || '',
                             tags: item.tags || [],
                             fingerprint: item.fingerprint || await generateFingerprint({}),
@@ -1705,6 +1732,14 @@ async function handleApiRequest(method, pathname, body, params, context = {}) {
                         };
                         profiles.push(newProfile);
                         imported++;
+                    }
+                    if (Array.isArray(yamlData?.outboundProxies)) {
+                        const currentSettings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : { preProxies: [], outboundProxies: [], subscriptions: [] };
+                        if (!currentSettings.outboundProxies) currentSettings.outboundProxies = [];
+                        yamlData.outboundProxies.forEach(p => {
+                            if (!currentSettings.outboundProxies.find(cp => cp.id === p.id)) currentSettings.outboundProxies.push(p);
+                        });
+                        await saveSettingsWithNormalizedExtensions(currentSettings);
                     }
                     await fs.writeJson(PROFILES_FILE, profiles);
                     notifyUIRefresh(); // Notify UI to refresh
@@ -1727,6 +1762,14 @@ async function handleApiRequest(method, pathname, body, params, context = {}) {
                     const newProfile = { ...profile, id: uuidv4(), name };
                     profiles.push(newProfile);
                     imported++;
+                }
+                const currentSettings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : { preProxies: [], outboundProxies: [], subscriptions: [] };
+                if (backupData.outboundProxies) {
+                    if (!currentSettings.outboundProxies) currentSettings.outboundProxies = [];
+                    backupData.outboundProxies.forEach(p => {
+                        if (!currentSettings.outboundProxies.find(cp => cp.id === p.id)) currentSettings.outboundProxies.push(p);
+                    });
+                    await saveSettingsWithNormalizedExtensions(currentSettings);
                 }
                 await fs.writeJson(PROFILES_FILE, profiles);
                 notifyUIRefresh(); // Notify UI to refresh
@@ -2867,12 +2910,6 @@ function summarizeProbeDetails(details = [], maxCount = 3) {
         .join('; ');
 }
 
-const DEFAULT_PROXY_PROBE_TARGETS = [
-    { url: 'https://www.gstatic.com/generate_204', expectedStatus: 204 },
-    { url: 'https://cp.cloudflare.com/generate_204', expectedStatus: 204 },
-    { url: 'https://www.google.com/generate_204', expectedStatus: 204 }
-];
-
 const HARD_PROXY_PROBE_PATTERNS = [
     /\bECONNRESET\b/i,
     /\bECONNREFUSED\b/i,
@@ -2889,21 +2926,8 @@ const HARD_PROXY_PROBE_PATTERNS = [
     /returned HTTP\s+[45]\d\d/i
 ];
 
-function normalizeProxyProbeTarget(target) {
-    if (!target) return null;
-    if (typeof target === 'string') {
-        return { url: target, expectedStatus: 204 };
-    }
-    const url = String(target.url || '').trim();
-    if (!url) return null;
-    return {
-        url,
-        expectedStatus: Number.isInteger(target.expectedStatus) ? target.expectedStatus : 204
-    };
-}
-
 function createProbeHttpStatusMessage(target, statusCode) {
-    return `${target.url} returned HTTP ${statusCode}`;
+    return `${formatProbeTargetForDisplay(target?.url)} returned HTTP ${statusCode}`;
 }
 
 function isWarmupLikeProbeMessage(msg = '') {
@@ -2933,10 +2957,12 @@ function shouldRetryProxyProbe(details = [], msg = '') {
     return isWarmupLikeProbeMessage(msg);
 }
 
-async function startPreProxyHealthCheck(url) {
+async function startPreProxyHealthCheck(url, probeOptions = {}) {
     if (!url) return null;
     try {
-        return await runProxyLatencyTest(url);
+        const timeoutMs = Number.isFinite(probeOptions.timeoutMs) ? probeOptions.timeoutMs : undefined;
+        const readyTimeoutMs = Number.isFinite(probeOptions.readyTimeoutMs) ? probeOptions.readyTimeoutMs : undefined;
+        return await runProxyLatencyTest(url, { ...probeOptions, readyTimeoutMs, timeoutMs });
     } catch (err) {
         return { success: false, msg: err?.message || String(err || 'Unknown error') };
     }
@@ -3033,14 +3059,57 @@ async function waitForSocksProxyUsable(socksPort, timeoutMs = 4500, connectTimeo
     return { success: false, msg: lastMsg, details: lastDetails };
 }
 
+const DEFAULT_PROXY_TEST_READY_TIMEOUT_MS = 1500;
+const DEFAULT_PROXY_TEST_TIMEOUT_MS = 4000;
+const MAX_PROXY_TEST_READY_TIMEOUT_MS = 10000;
+const MAX_PROXY_TEST_TIMEOUT_MS = 15000;
+const MAX_PROXY_LATENCY_BATCH_SIZE = 100;
+
 function createProbeTimeoutMessage(target, timeoutMs, stage = 'connect') {
     return `${target.host}:${target.port} ${stage} timeout after ${timeoutMs}ms`;
 }
 
-async function measureSocksConnectLatency(socksPort, timeoutMs = 4000, customTargets = null) {
-    const targets = Array.isArray(customTargets) && customTargets.length > 0
-        ? customTargets.map((target) => normalizeProxyProbeTarget(target)).filter(Boolean)
-        : DEFAULT_PROXY_PROBE_TARGETS.map((target) => ({ ...target }));
+function clampProxyTestTimeout(value, fallback, maxValue) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric) || numeric <= 0) return fallback;
+    return Math.min(Math.round(numeric), maxValue);
+}
+
+function formatProbeTargetForDisplay(value) {
+    try {
+        const targetUrl = value instanceof URL ? value : new URL(String(value || ''));
+        return `${targetUrl.origin}${targetUrl.pathname}`;
+    } catch (e) {
+        return 'unknown target';
+    }
+}
+
+function sanitizeProxyTestMessage(message, fallback = 'Proxy test failed') {
+    const text = String(message || '').replace(/[a-z][a-z0-9+.-]*:\/\/[^\s'"]+/gi, '[redacted proxy]');
+    return text || fallback;
+}
+
+function watchXrayProcess(processRef, options = {}) {
+    const spawnErrorPromise = new Promise((resolve) => {
+        processRef.once('error', (err) => resolve(err));
+    });
+    if (options.drainOutput) {
+        processRef.stderr?.on('data', () => { });
+        processRef.stdout?.on('data', () => { });
+    }
+    return spawnErrorPromise;
+}
+
+async function waitForXrayPortOrSpawnError(processRef, port, timeoutMs) {
+    const spawnErrorPromise = watchXrayProcess(processRef);
+    return await Promise.race([
+        waitForLocalPortReady(port, timeoutMs).then((ready) => ({ ready })),
+        spawnErrorPromise.then((spawnError) => ({ ready: false, spawnError }))
+    ]);
+}
+
+async function measureSocksConnectLatency(socksPort, timeoutMs = DEFAULT_PROXY_TEST_TIMEOUT_MS, customTargets = null) {
+    const targets = normalizeProxyProbeTargets({ targets: customTargets });
 
     const probeTarget = async (target) => {
         const start = process.hrtime.bigint();
@@ -3049,8 +3118,9 @@ async function measureSocksConnectLatency(socksPort, timeoutMs = 4000, customTar
         try {
             const agent = await createSocksProxyAgent(`socks5h://127.0.0.1:${socksPort}`);
             const targetUrl = new URL(target.url);
+            const client = targetUrl.protocol === 'http:' ? http : https;
             const latency = await new Promise((resolve, reject) => {
-                req = https.get(targetUrl, {
+                req = client.get(targetUrl, {
                     agent,
                     headers: {
                         'User-Agent': 'GeekEZ-Browser/1.0',
@@ -3061,7 +3131,7 @@ async function measureSocksConnectLatency(socksPort, timeoutMs = 4000, customTar
                     res = response;
                     const statusCode = Number(response.statusCode || 0);
                     response.resume();
-                    if (statusCode !== target.expectedStatus) {
+                    if (!shouldAcceptProbeStatus(target, statusCode)) {
                         const err = new Error(createProbeHttpStatusMessage(target, statusCode));
                         err.stage = 'http';
                         err.statusCode = statusCode;
@@ -3086,12 +3156,12 @@ async function measureSocksConnectLatency(socksPort, timeoutMs = 4000, customTar
             return {
                 success: true,
                 latency,
-                target: targetUrl.host
+                target: formatProbeTargetForDisplay(targetUrl)
             };
         } catch (err) {
             return {
                 success: false,
-                target: target?.url || 'unknown target',
+                target: formatProbeTargetForDisplay(target?.url),
                 stage: err?.stage || 'request',
                 msg: err?.code || err?.message || 'Connect failed',
                 elapsedMs: Number(process.hrtime.bigint() - start) / 1e6
@@ -3137,7 +3207,7 @@ async function measureSocksConnectLatency(socksPort, timeoutMs = 4000, customTar
     });
 }
 
-async function runProxyLatencyTest(proxyStr) {
+async function runProxyLatencyTest(proxyStr, probeOptions = {}) {
     const tempPort = await getAvailablePort();
     const tempConfigPath = path.join(app.getPath('userData'), `test_config_${tempPort}.json`);
     let xrayProcess = null;
@@ -3168,23 +3238,29 @@ async function runProxyLatencyTest(proxyStr) {
         await fs.writeJson(tempConfigPath, config);
 
         xrayProcess = spawn(BIN_PATH, ['-c', tempConfigPath], { cwd: BIN_DIR, env: { ...process.env, 'XRAY_LOCATION_ASSET': RESOURCES_BIN }, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
-        let xrayErr = '';
-        xrayProcess.stderr.on('data', d => {
-            const chunk = d.toString();
-            xrayErr += chunk;
-            if (xrayErr.length > 5000) xrayErr = xrayErr.substring(xrayErr.length - 5000);
-        });
-        xrayProcess.stdout.on('data', () => { });
+        xrayProcess.stderr?.on('data', () => { });
+        xrayProcess.stdout?.on('data', () => { });
 
-        const ready = await waitForLocalPortReady(tempPort, 1500);
+        const readyTimeoutMs = clampProxyTestTimeout(probeOptions.readyTimeoutMs, DEFAULT_PROXY_TEST_READY_TIMEOUT_MS, MAX_PROXY_TEST_READY_TIMEOUT_MS);
+        const { ready, spawnError } = await waitForXrayPortOrSpawnError(xrayProcess, tempPort, readyTimeoutMs);
+        if (spawnError) {
+            xrayProcess = null;
+            try { fs.unlinkSync(tempConfigPath); } catch (e) { }
+            return { success: false, msg: sanitizeProxyTestMessage(spawnError.message, 'Xray start failed') };
+        }
         if (!ready || xrayProcess.exitCode !== null) {
-            return { success: false, msg: `Xray crashed: ${xrayErr.substring(0, 150) || 'unknown'}` };
+            await forceKill(xrayProcess.pid);
+            xrayProcess = null;
+            try { fs.unlinkSync(tempConfigPath); } catch (e) { }
+            return { success: false, msg: 'Xray not ready' };
         }
 
-        const result = await measureSocksConnectLatency(tempPort, 4000);
-        if (!result.success && !result.xrayLog && xrayErr) {
-            result.xrayLog = xrayErr.substring(0, 500);
-        }
+        const probeTimeoutMs = clampProxyTestTimeout(probeOptions.timeoutMs, DEFAULT_PROXY_TEST_TIMEOUT_MS, MAX_PROXY_TEST_TIMEOUT_MS);
+        const result = await measureSocksConnectLatency(
+            tempPort,
+            probeTimeoutMs,
+            normalizeProxyProbeTargets(probeOptions)
+        );
         await forceKill(xrayProcess.pid);
         xrayProcess = null;
         try { fs.unlinkSync(tempConfigPath); } catch (e) { }
@@ -3192,7 +3268,59 @@ async function runProxyLatencyTest(proxyStr) {
     } catch (err) {
         if (xrayProcess) try { await forceKill(xrayProcess.pid); } catch (e) { }
         try { fs.unlinkSync(tempConfigPath); } catch (e) { }
-        return { success: false, msg: err.message };
+        return { success: false, msg: sanitizeProxyTestMessage(err?.message) };
+    }
+}
+
+async function runProxyChainLatencyTest(payload = {}, probeOptions = {}) {
+    const outboundUrl = String(payload?.outboundUrl || '').trim();
+    const preProxyUrl = String(payload?.preProxyUrl || '').trim();
+    if (!outboundUrl) return { success: false, msg: 'Outbound proxy required' };
+    if (!preProxyUrl) return { success: false, msg: 'Pre-proxy required' };
+
+    const tempPort = await getAvailablePort();
+    const tempConfigPath = path.join(app.getPath('userData'), `test_chain_config_${tempPort}.json`);
+    let xrayProcess = null;
+    try {
+        const config = generateXrayConfig(
+            outboundUrl,
+            tempPort,
+            { preProxies: [{ id: 'chain-test-pre', url: preProxyUrl }] }
+        );
+        await fs.writeJson(tempConfigPath, config);
+
+        xrayProcess = spawn(BIN_PATH, ['-c', tempConfigPath], { cwd: BIN_DIR, env: { ...process.env, 'XRAY_LOCATION_ASSET': RESOURCES_BIN }, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+        xrayProcess.stderr?.on('data', () => { });
+        xrayProcess.stdout?.on('data', () => { });
+
+        const readyTimeoutMs = clampProxyTestTimeout(probeOptions.readyTimeoutMs, DEFAULT_PROXY_TEST_READY_TIMEOUT_MS, MAX_PROXY_TEST_READY_TIMEOUT_MS);
+        const { ready, spawnError } = await waitForXrayPortOrSpawnError(xrayProcess, tempPort, readyTimeoutMs);
+        if (spawnError) {
+            xrayProcess = null;
+            try { fs.unlinkSync(tempConfigPath); } catch (e) { }
+            return { success: false, msg: sanitizeProxyTestMessage(spawnError.message, 'Xray start failed') };
+        }
+        if (!ready || xrayProcess.exitCode !== null) {
+            await forceKill(xrayProcess.pid);
+            xrayProcess = null;
+            try { fs.unlinkSync(tempConfigPath); } catch (e) { }
+            return { success: false, msg: 'Xray not ready' };
+        }
+
+        const probeTimeoutMs = clampProxyTestTimeout(probeOptions.timeoutMs, DEFAULT_PROXY_TEST_TIMEOUT_MS, MAX_PROXY_TEST_TIMEOUT_MS);
+        const result = await measureSocksConnectLatency(
+            tempPort,
+            probeTimeoutMs,
+            normalizeProxyProbeTargets(probeOptions)
+        );
+        await forceKill(xrayProcess.pid);
+        xrayProcess = null;
+        try { fs.unlinkSync(tempConfigPath); } catch (e) { }
+        return result;
+    } catch (err) {
+        if (xrayProcess) try { await forceKill(xrayProcess.pid); } catch (e) { }
+        try { fs.unlinkSync(tempConfigPath); } catch (e) { }
+        return { success: false, msg: sanitizeProxyTestMessage(err?.message) };
     }
 }
 
@@ -3212,16 +3340,19 @@ async function mapWithConcurrency(items, concurrency, worker) {
     return results;
 }
 
-ipcMain.handle('test-proxy-latency', async (_e, proxyStr) => {
-    return await runProxyLatencyTest(proxyStr);
+ipcMain.handle('test-proxy-latency', async (_e, proxyStr, probeOptions = {}) => {
+    return await runProxyLatencyTest(proxyStr, probeOptions);
 });
-ipcMain.handle('test-proxy-latency-batch', async (_e, entries) => {
-    const list = Array.isArray(entries) ? entries : [];
+ipcMain.handle('test-proxy-chain-latency', async (_e, payload = {}, probeOptions = {}) => {
+    return await runProxyChainLatencyTest(payload, probeOptions);
+});
+ipcMain.handle('test-proxy-latency-batch', async (_e, entries, probeOptions = {}) => {
+    const list = (Array.isArray(entries) ? entries : []).slice(0, MAX_PROXY_LATENCY_BATCH_SIZE);
     const concurrency = Math.min(6, Math.max(1, list.length));
     return await mapWithConcurrency(list, concurrency, async (entry) => {
         const id = entry?.id;
         const url = String(entry?.url || '');
-        const result = await runProxyLatencyTest(url);
+        const result = await runProxyLatencyTest(url, probeOptions);
         return { id, ...result };
     });
 });
@@ -3340,6 +3471,24 @@ ipcMain.handle('save-profile', async (event, data) => {
     notifyUIRefresh();
     return newProfile;
 });
+ipcMain.handle('preview-canvas-fingerprint', async (event, data = {}) => {
+    const input = data && typeof data === 'object' ? data : {};
+    const inputFp = input.fingerprint && typeof input.fingerprint === 'object' ? input.fingerprint : {};
+    const source = { ...inputFp, ...input };
+    delete source.fingerprint;
+    const profileId = String(firstDefined(input.profileId, input.id, source.noiseSeedProfileId, '') || '').trim();
+    if (source.webglProfile && source.webgl?.profileId && source.webglProfile !== source.webgl.profileId && !hasOwn(input, 'webgl')) {
+        delete source.webgl;
+    }
+    const normalizedFingerprint = normalizeFingerprint(source);
+    const fingerprint = input.rotateNoiseSeed === true
+        ? rotateProfileNoiseSeed(normalizedFingerprint, profileId)
+        : ensureProfileScopedNoiseSeed(normalizedFingerprint, profileId, {
+            deriveOnMissingProfileId: false,
+            deriveOnProfileMismatch: false
+        });
+    return buildCanvasFingerprintPreview(fingerprint, profileId);
+});
 ipcMain.handle('delete-profile', async (event, id) => {
     // 关闭正在运行的进程
     if (activeProcesses[id]) {
@@ -3396,15 +3545,19 @@ ipcMain.handle('delete-profile', async (event, id) => {
 });
 ipcMain.handle('get-settings', async () => {
     if (!fs.existsSync(SETTINGS_FILE)) {
-        return {
+        return normalizeSettingsSnapshot({
             preProxies: [],
+            outboundProxies: [],
             mode: 'single',
             enablePreProxy: false,
+            enableOutboundProxy: false,
+            outboundMode: 'single',
+            selectedOutboundId: null,
             enableRemoteDebugging: false,
             enableUaWebglModify: false,
             closeBehavior: CLOSE_BEHAVIOR.TRAY,
             userExtensions: []
-        };
+        });
     }
     const settings = await fs.readJson(SETTINGS_FILE);
     return normalizeSettingsSnapshot(settings);
@@ -3711,6 +3864,7 @@ function cleanFingerprint(fp) {
     const cleaned = { ...fp };
     // secChUa can be regenerated from userAgentMetadata at runtime.
     delete cleaned.secChUa;
+    delete cleaned.noiseSeedProfileId;
     if (!cleaned.webglProfile && cleaned.webgl?.profileId) {
         cleaned.webglProfile = cleaned.webgl.profileId;
     }
@@ -3813,7 +3967,7 @@ ipcMain.handle('get-export-profiles', async () => {
 // 导出选定环境 (精简版，不含浏览器数据)
 ipcMain.handle('export-selected-data', async (e, { type, profileIds }) => {
     const allProfiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : [];
-    const settings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : { preProxies: [], subscriptions: [] };
+    const settings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : { preProxies: [], outboundProxies: [], subscriptions: [] };
 
     // 过滤选中的环境
     const selectedProfiles = allProfiles
@@ -3830,6 +3984,7 @@ ipcMain.handle('export-selected-data', async (e, { type, profileIds }) => {
     }
     if (type === 'all' || type === 'proxies') {
         exportObj.preProxies = settings.preProxies || [];
+        exportObj.outboundProxies = settings.outboundProxies || [];
         exportObj.subscriptions = settings.subscriptions || [];
     }
 
@@ -3869,7 +4024,7 @@ ipcMain.handle('export-full-backup', async (e, { profileIds, password, filePath 
         
         currentImportProgress = { percent: 5, message: 'Preparing Profiles...', processing: true };
         const allProfiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : [];
-        const settings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : { preProxies: [], subscriptions: [] };
+        const settings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : { preProxies: [], outboundProxies: [], subscriptions: [] };
 
         const selectedProfiles = allProfiles
             .filter(p => profileIds.includes(p.id))
@@ -3880,6 +4035,7 @@ ipcMain.handle('export-full-backup', async (e, { profileIds, password, filePath 
             createdAt: Date.now(),
             profiles: selectedProfiles,
             preProxies: settings.preProxies || [],
+            outboundProxies: settings.outboundProxies || [],
             subscriptions: settings.subscriptions || [],
             browserData: {}
         };
@@ -4036,11 +4192,17 @@ ipcMain.handle('import-full-backup', async (e, { filePath, password }) => {
 
         // 还原代理和订阅
         currentImportProgress = { percent: 50, message: 'Restoring Proxies & Settings...', processing: true };
-        const currentSettings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : { preProxies: [], subscriptions: [] };
+        const currentSettings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : { preProxies: [], outboundProxies: [], subscriptions: [] };
         if (backupData.preProxies) {
             if (!currentSettings.preProxies) currentSettings.preProxies = [];
             for (const p of backupData.preProxies) {
                 if (!currentSettings.preProxies.find(cp => cp.id === p.id)) currentSettings.preProxies.push(p);
+            }
+        }
+        if (backupData.outboundProxies) {
+            if (!currentSettings.outboundProxies) currentSettings.outboundProxies = [];
+            for (const p of backupData.outboundProxies) {
+                if (!currentSettings.outboundProxies.find(cp => cp.id === p.id)) currentSettings.outboundProxies.push(p);
             }
         }
         if (backupData.subscriptions) {
@@ -4159,7 +4321,7 @@ ipcMain.handle('import-data', async () => {
             const data = yaml.load(content);
             let updated = false;
 
-            if (data.profiles || data.preProxies || data.subscriptions) {
+            if (data.profiles || data.preProxies || data.outboundProxies || data.subscriptions) {
                 if (Array.isArray(data.profiles)) {
                     const currentProfiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : [];
                     data.profiles.forEach(p => {
@@ -4173,12 +4335,18 @@ ipcMain.handle('import-data', async () => {
                     await fs.writeJson(PROFILES_FILE, currentProfiles);
                     updated = true;
                 }
-                if (Array.isArray(data.preProxies) || Array.isArray(data.subscriptions)) {
-                    const currentSettings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : { preProxies: [], subscriptions: [] };
+                if (Array.isArray(data.preProxies) || Array.isArray(data.outboundProxies) || Array.isArray(data.subscriptions)) {
+                    const currentSettings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : { preProxies: [], outboundProxies: [], subscriptions: [] };
                     if (data.preProxies) {
                         if (!currentSettings.preProxies) currentSettings.preProxies = [];
                         data.preProxies.forEach(p => {
                             if (!currentSettings.preProxies.find(cp => cp.id === p.id)) currentSettings.preProxies.push(p);
+                        });
+                    }
+                    if (data.outboundProxies) {
+                        if (!currentSettings.outboundProxies) currentSettings.outboundProxies = [];
+                        data.outboundProxies.forEach(p => {
+                            if (!currentSettings.outboundProxies.find(cp => cp.id === p.id)) currentSettings.outboundProxies.push(p);
                         });
                     }
                     if (data.subscriptions) {
@@ -4210,7 +4378,7 @@ ipcMain.handle('import-data', async () => {
 // 保留旧的 export-data 用于向后兼容 (deprecated)
 ipcMain.handle('export-data', async (e, type) => {
     const profiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : [];
-    const settings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : { preProxies: [], subscriptions: [] };
+    const settings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : { preProxies: [], outboundProxies: [], subscriptions: [] };
 
     // 清理 fingerprint
     const cleanedProfiles = profiles.map(p => ({
@@ -4222,6 +4390,7 @@ ipcMain.handle('export-data', async (e, type) => {
     if (type === 'all' || type === 'profiles') exportObj.profiles = cleanedProfiles;
     if (type === 'all' || type === 'proxies') {
         exportObj.preProxies = settings.preProxies || [];
+        exportObj.outboundProxies = settings.outboundProxies || [];
         exportObj.subscriptions = settings.subscriptions || [];
     }
     if (Object.keys(exportObj).length === 0) return false;
@@ -4307,77 +4476,82 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
     }
 
     await markLaunching(true);
-    updateLaunchProgress(
-        5,
-        preferredLang === 'en' ? 'Loading profile settings...' : '正在读取环境配置...',
-        true,
-        { step: 1 }
-    );
-    await new Promise(resolve => setTimeout(resolve, 500));
-
-    // Load settings early for userExtensions and remote debugging
-    const settings = await fs.readJson(SETTINGS_FILE).catch(() => ({
-        enableRemoteDebugging: false,
-        enableUaWebglModify: false,
-        userExtensions: [],
-        preProxies: [],
-        mode: 'single',
-        enablePreProxy: false
-    }));
-    const uiLang = preferredLang === 'en' ? 'en' : (settings.lang === 'en' ? 'en' : 'cn');
-
-    const profiles = await fs.readJson(PROFILES_FILE);
-    const profileIndex = profiles.findIndex(p => p.id === profileId);
-    const profile = profileIndex > -1 ? profiles[profileIndex] : null;
-    if (!profile) throw new Error('Profile not found');
-    const progressProfileName = profile.name || profileId;
-
-    ensureProxyStrValid(profile.proxyStr);
-    profile.fingerprint = normalizeFingerprint(profile.fingerprint || {});
-    updateLaunchProgress(
-        12,
-        preferredLang === 'en' ? 'Validating profile configuration...' : '正在校验环境配置...',
-        true,
-        { step: 2, profileName: progressProfileName }
-    );
-
-    // Auto-assign a stable remote debugging port when feature is enabled and no explicit port exists.
-    if (settings.enableRemoteDebugging && !normalizeDebugPort(profile.debugPort)) {
-        profile.debugPort = await allocateDebugPortIfNeeded(settings, profiles, null);
-        profiles[profileIndex] = profile;
-        await fs.writeJson(PROFILES_FILE, profiles);
-    }
-
-    const useDirectNetwork = isDirectProxy(profile.proxyStr);
-
-    // Pre-proxy settings (settings already loaded above)
-    const override = profile.preProxyOverride || 'default';
-    const shouldUsePreProxy = (override === 'on' || (override === 'default' && settings.enablePreProxy));
-    let finalPreProxyConfig = null;
-    let activePreProxy = null;
-    let switchMsg = null;
-    if (shouldUsePreProxy && settings.preProxies && settings.preProxies.length > 0) {
-        const active = settings.preProxies.filter(p => p.enable !== false);
-        if (active.length > 0) {
-            if (settings.mode === 'single') {
-                activePreProxy = active.find(p => p.id === settings.selectedId) || active[0];
-                finalPreProxyConfig = { preProxies: [activePreProxy] };
-            } else if (settings.mode === 'balance') {
-                activePreProxy = active[Math.floor(Math.random() * active.length)];
-                finalPreProxyConfig = { preProxies: [activePreProxy] };
-                if (settings.notify) switchMsg = `Balance: [${activePreProxy.remark}]`;
-            } else if (settings.mode === 'failover') {
-                activePreProxy = active[0];
-                finalPreProxyConfig = { preProxies: [activePreProxy] };
-                if (settings.notify) switchMsg = `Failover: [${activePreProxy.remark}]`;
-            }
-        }
-    }
-
     let xrayProcess = null;
     let logFd;
     let browser = null;
     try {
+        updateLaunchProgress(
+            5,
+            preferredLang === 'en' ? 'Loading profile settings...' : '正在读取环境配置...',
+            true,
+            { step: 1 }
+        );
+        await new Promise(resolve => setTimeout(resolve, 500));
+
+        // Load settings early for userExtensions and remote debugging
+        const settings = normalizeSettingsSnapshot(await fs.readJson(SETTINGS_FILE).catch(() => ({
+            enableRemoteDebugging: false,
+            enableUaWebglModify: false,
+            userExtensions: [],
+            preProxies: [],
+            mode: 'single',
+            enablePreProxy: false
+        })));
+        const uiLang = preferredLang === 'en' ? 'en' : (settings.lang === 'en' ? 'en' : 'cn');
+        const proxyProbeTargets = normalizeProxyProbeTargets(settings);
+        const proxyStartupHealthCheck = normalizeProxyStartupHealthConfig(settings);
+
+        const profiles = await fs.readJson(PROFILES_FILE);
+        const profileIndex = profiles.findIndex(p => p.id === profileId);
+        const profile = profileIndex > -1 ? profiles[profileIndex] : null;
+        if (!profile) throw new Error('Profile not found');
+        const progressProfileName = profile.name || profileId;
+
+        const resolvedProfileProxy = resolveProfileProxy(profile, settings);
+        if (!resolvedProfileProxy.isDirect) {
+            ensureProxyStrValid(resolvedProfileProxy.proxyStr);
+        }
+        const previousLaunchFingerprint = profile.fingerprint || {};
+        const launchFingerprint = ensureProfileScopedNoiseSeed(normalizeFingerprint(previousLaunchFingerprint), profile.id, {
+            deriveOnMissingProfileId: false,
+            deriveOnProfileMismatch: false
+        });
+        const shouldPersistLaunchFingerprint = previousLaunchFingerprint.noiseSeed !== launchFingerprint.noiseSeed ||
+            previousLaunchFingerprint.noiseSeedProfileId !== launchFingerprint.noiseSeedProfileId;
+        profile.fingerprint = launchFingerprint;
+        if (shouldPersistLaunchFingerprint) {
+            profiles[profileIndex] = profile;
+            await fs.writeJson(PROFILES_FILE, profiles);
+        }
+        updateLaunchProgress(
+            12,
+            preferredLang === 'en' ? 'Validating profile configuration...' : '正在校验环境配置...',
+            true,
+            { step: 2, profileName: progressProfileName }
+        );
+
+        // Auto-assign a stable remote debugging port when feature is enabled and no explicit port exists.
+        if (settings.enableRemoteDebugging && !normalizeDebugPort(profile.debugPort)) {
+            profile.debugPort = await allocateDebugPortIfNeeded(settings, profiles, null);
+            profiles[profileIndex] = profile;
+            await fs.writeJson(PROFILES_FILE, profiles);
+        }
+
+        const useDirectNetwork = resolvedProfileProxy.isDirect;
+
+        // Pre-proxy settings (settings already loaded above)
+        let finalPreProxyConfig = null;
+        let activePreProxy = resolveProfilePreProxy(profile, settings);
+        let switchMsg = null;
+        if (activePreProxy) {
+            finalPreProxyConfig = { preProxies: [activePreProxy] };
+            const preProxyFields = normalizeProfilePreProxyFields(profile);
+            if (!preProxyFields.preProxyId && settings.notify) {
+                if (settings.mode === 'balance') switchMsg = `Balance: [${activePreProxy.remark}]`;
+                if (settings.mode === 'failover') switchMsg = `Failover: [${activePreProxy.remark}]`;
+            }
+        }
+
         const profileDir = path.join(DATA_PATH, profileId);
         const userDataDir = path.join(profileDir, 'browser_data');
         fs.ensureDirSync(userDataDir);
@@ -4421,54 +4595,28 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
             localPort = await getAvailablePort();
             const xrayConfigPath = path.join(profileDir, 'config.json');
             xrayLogPath = path.join(profileDir, 'xray_run.log');
-            const upstreamProxy = useDirectNetwork ? activePreProxy?.url : profile.proxyStr;
+            const upstreamProxy = useDirectNetwork ? activePreProxy?.url : resolvedProfileProxy.proxyStr;
             const chainedPreProxy = useDirectNetwork ? null : finalPreProxyConfig;
             const config = generateXrayConfig(upstreamProxy, localPort, chainedPreProxy, profile.fingerprint);
             fs.writeJsonSync(xrayConfigPath, config);
             logFd = fs.openSync(xrayLogPath, 'a');
             const xrayLaunchStartedAt = Date.now();
             xrayProcess = spawn(BIN_PATH, ['-c', xrayConfigPath], { cwd: BIN_DIR, env: { ...process.env, 'XRAY_LOCATION_ASSET': RESOURCES_BIN }, stdio: ['ignore', logFd, logFd], windowsHide: true });
-            const preProxyLabel = activePreProxy?.remark || activePreProxy?.name || activePreProxy?.id || '';
-            const preProxyCheckPromise = activePreProxy?.url
-                ? startPreProxyHealthCheck(activePreProxy.url)
-                : null;
-            const throwPreProxyCheckError = (preProxyCheck) => {
-                updateLaunchProgress(
-                    56,
-                    preferredLang === 'en'
-                        ? `Checking pre-proxy node${preProxyLabel ? ` [${preProxyLabel}]` : ''}...`
-                        : `正在检测前置代理节点${preProxyLabel ? ` [${preProxyLabel}]` : ''}...`,
-                    true,
-                    { step: 5, profileName: progressProfileName }
-                );
-                throw createPreProxyStartupError(
-                    profile.name,
-                    activePreProxy?.remark || activePreProxy?.name || '',
-                    preProxyCheck?.msg || 'pre-proxy unavailable',
-                    uiLang
-                );
-            };
-            const awaitWithPreProxyPriority = async (stepPromise) => {
-                if (!preProxyCheckPromise) return await stepPromise;
-                const taggedStepPromise = Promise.resolve(stepPromise).then((value) => ({ type: 'step', value }));
-                const taggedPreProxyPromise = preProxyCheckPromise.then((result) => ({ type: 'pre', result }));
-                const first = await Promise.race([taggedStepPromise, taggedPreProxyPromise]);
-                if (first.type === 'pre') {
-                    if (!first.result?.success) {
-                        throwPreProxyCheckError(first.result);
-                    }
-                    return await stepPromise;
-                }
-                return first.value;
-            };
+            const xraySpawnErrorPromise = watchXrayProcess(xrayProcess);
             updateLaunchProgress(
                 40,
                 preferredLang === 'en' ? 'Waiting for local proxy port...' : '正在等待本地代理端口就绪...',
                 true,
                 { step: 4, profileName: progressProfileName }
             );
-            const readyTimeoutMs = 2500;
-            const ready = await awaitWithPreProxyPriority(waitForLocalPortReady(localPort, readyTimeoutMs));
+            const readyTimeoutMs = proxyStartupHealthCheck.readyTimeoutMs;
+            const { ready, spawnError } = await Promise.race([
+                waitForLocalPortReady(localPort, readyTimeoutMs).then((isReady) => ({ ready: isReady })),
+                xraySpawnErrorPromise.then((err) => ({ ready: false, spawnError: err }))
+            ]);
+            if (spawnError) {
+                throw createProxyStartupError(profile.name, 'xray failed to start', xrayLogPath, uiLang);
+            }
             if (!ready) {
                 const exitCode = xrayProcess.exitCode;
                 const reason = exitCode !== null
@@ -4479,10 +4627,13 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
 
             // Xray may bind the local SOCKS port before the upstream proxy chain is fully usable.
             // Chained pre-proxy setups need a bit more warm-up budget before the first probe.
-            const minWarmupMs = activePreProxy ? 1200 : 300;
+            const startupHealthPhase = activePreProxy?.url
+                ? proxyStartupHealthCheck.preProxy
+                : proxyStartupHealthCheck.direct;
+            const minWarmupMs = startupHealthPhase.warmupMs;
             const remainingWarmupMs = minWarmupMs - (Date.now() - xrayLaunchStartedAt);
             if (remainingWarmupMs > 0) {
-                await awaitWithPreProxyPriority(new Promise((resolve) => setTimeout(resolve, remainingWarmupMs)));
+                await new Promise((resolve) => setTimeout(resolve, remainingWarmupMs));
             }
 
             updateLaunchProgress(
@@ -4493,44 +4644,19 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
                 true,
                 { step: 5, profileName: progressProfileName }
             );
-            const proxyUsable = await awaitWithPreProxyPriority(
-                waitForProxyChainReady(
-                    localPort,
-                    xrayProcess,
-                    activePreProxy?.url
-                        ? {
-                            fastReadyTimeoutMs: 2600,
-                            fastProbeTimeoutMs: 1000,
-                            slowReadyTimeoutMs: 4200,
-                            slowProbeTimeoutMs: 1800
-                        }
-                        : {
-                            fastReadyTimeoutMs: 2200,
-                            fastProbeTimeoutMs: 900,
-                            slowReadyTimeoutMs: 2600,
-                            slowProbeTimeoutMs: 1400
-                        }
-                )
+            const proxyUsable = await waitForProxyChainReady(
+                localPort,
+                xrayProcess,
+                {
+                    fastReadyTimeoutMs: startupHealthPhase.fastReadyTimeoutMs,
+                    fastProbeTimeoutMs: startupHealthPhase.fastProbeTimeoutMs,
+                    slowReadyTimeoutMs: startupHealthPhase.slowReadyTimeoutMs,
+                    slowProbeTimeoutMs: startupHealthPhase.slowProbeTimeoutMs,
+                    targets: proxyProbeTargets
+                }
             );
             if (!proxyUsable.success) {
                 const probeSummary = summarizeProbeDetails(proxyUsable.details, 3);
-                if (activePreProxy?.url) {
-                    updateLaunchProgress(
-                        56,
-                        preferredLang === 'en'
-                            ? `Checking pre-proxy node${preProxyLabel ? ` [${preProxyLabel}]` : ''}...`
-                            : `正在检测前置代理节点${preProxyLabel ? ` [${preProxyLabel}]` : ''}...`,
-                        true,
-                        { step: 5, profileName: progressProfileName }
-                    );
-                    const preProxyCheck = preProxyCheckPromise
-                        ? await preProxyCheckPromise
-                        : await startPreProxyHealthCheck(activePreProxy.url);
-                    if (!preProxyCheck.success) {
-                        throwPreProxyCheckError(preProxyCheck);
-                    }
-                }
-
                 throw createProxyStartupError(
                     profile.name,
                     probeSummary || proxyUsable.msg || 'proxy chain not usable after startup',
@@ -4667,10 +4793,7 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
 
         // 6. Custom Launch Arguments (if enabled)
         if (settings.enableCustomArgs && profile.customArgs) {
-            const customArgsList = profile.customArgs
-                .split(/[\n\s]+/)
-                .map(arg => arg.trim())
-                .filter(arg => arg && arg.startsWith('--'));
+            const customArgsList = parseCustomLaunchArgs(profile.customArgs);
 
             if (customArgsList.length > 0) {
                 launchArgs.push(...customArgsList);
@@ -4718,7 +4841,7 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
             userDataDir: userDataDir,
             args: launchArgs,
             defaultViewport: null,
-            ignoreDefaultArgs: ['--enable-automation'],
+            ignoreDefaultArgs: ['--enable-automation', '--disable-extensions'],
             pipe: false,
             dumpio: false,
             env: env  // 注入环境变量
@@ -4840,6 +4963,122 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
 })();
             `;
         })();
+        const workerInjectScript = getWorkerInjectScript(profile.fingerprint);
+        const documentFingerprintScript = [fingerprintInjectScript, watermarkInjectScript, webglOverrideScript].join('\n;');
+        const cdpInjectedSessions = new WeakSet();
+        const cdpAutoAttachSessions = new WeakSet();
+        const cdpAutoAttachListenerSessions = new WeakSet();
+        const fingerprintTargetAutoAttachParams = {
+            autoAttach: true,
+            waitForDebuggerOnStart: true,
+            flatten: true,
+            filter: [
+                { type: 'page' },
+                { type: 'iframe' },
+                { type: 'worker' },
+                { type: 'shared_worker' },
+                { type: 'service_worker' }
+            ]
+        };
+
+        const getAttachedTargetSession = (parentSession, sessionId) => {
+            try {
+                const connection = parentSession && typeof parentSession.connection === 'function'
+                    ? parentSession.connection()
+                    : null;
+                return connection && typeof connection.session === 'function'
+                    ? connection.session(sessionId)
+                    : null;
+            } catch (e) {
+                return null;
+            }
+        };
+
+        const addDocumentScriptToTarget = async (session, source) => {
+            await session.send('Page.enable');
+            try {
+                await session.send('Page.addScriptToEvaluateOnNewDocument', { source, runImmediately: true });
+            } catch (e) {
+                await session.send('Page.addScriptToEvaluateOnNewDocument', { source });
+            }
+        };
+
+        const runIfWaitingForDebugger = async (session) => {
+            if (!session) return;
+            try { await session.send('Runtime.runIfWaitingForDebugger'); } catch (e) { }
+        };
+
+        const isWorkerFingerprintTargetType = (targetType) => targetType === 'worker'
+            || targetType === 'shared_worker'
+            || targetType === 'service_worker';
+        const isFingerprintTargetType = (targetType) => targetType === 'page'
+            || targetType === 'iframe'
+            || isWorkerFingerprintTargetType(targetType);
+
+        const applyFingerprintTargetSession = async (session, targetInfo) => {
+            if (!session) return;
+
+            const targetType = String((targetInfo && targetInfo.type) || '').toLowerCase();
+            if (cdpInjectedSessions.has(session)) return;
+            if (!isFingerprintTargetType(targetType)) return;
+
+            if (targetType === 'page' || targetType === 'iframe') {
+                await addDocumentScriptToTarget(session, documentFingerprintScript);
+                cdpInjectedSessions.add(session);
+                return;
+            }
+
+            if (isWorkerFingerprintTargetType(targetType)) {
+                await session.send('Runtime.enable');
+                const workerEvaluation = await session.send('Runtime.evaluate', {
+                    expression: workerInjectScript,
+                    awaitPromise: false,
+                    returnByValue: true
+                });
+                if (workerEvaluation.exceptionDetails || !workerEvaluation.result || workerEvaluation.result.value !== true) {
+                    throw new Error('Worker fingerprint injection failed');
+                }
+                cdpInjectedSessions.add(session);
+            }
+        };
+
+        const configureFingerprintTargetAutoAttach = async (session) => {
+            if (!session) return false;
+            if (!cdpAutoAttachListenerSessions.has(session)) {
+                cdpAutoAttachListenerSessions.add(session);
+                if (typeof session.on === 'function') {
+                    session.on('Target.attachedToTarget', (event) => {
+                        Promise.resolve().then(async () => {
+                            const childSession = getAttachedTargetSession(session, event && event.sessionId);
+                            if (!childSession) return;
+                            try {
+                                try { await configureFingerprintTargetAutoAttach(childSession); } catch (e) { }
+                                await applyFingerprintTargetSession(childSession, event.targetInfo || {});
+                            } finally {
+                                await runIfWaitingForDebugger(childSession);
+                            }
+                        }).catch(() => { });
+                    });
+                }
+            }
+
+            if (cdpAutoAttachSessions.has(session)) return true;
+            try {
+                await session.send('Target.setAutoAttach', fingerprintTargetAutoAttachParams);
+            } catch (e) {
+                const { filter, ...fallbackParams } = fingerprintTargetAutoAttachParams;
+                await session.send('Target.setAutoAttach', fallbackParams);
+            }
+            cdpAutoAttachSessions.add(session);
+            return true;
+        };
+
+        const installFingerprintTargetInjection = async (browserInstance) => {
+            const browserSession = await browserInstance.target().createCDPSession();
+            await configureFingerprintTargetAutoAttach(browserSession);
+        };
+
+        await installFingerprintTargetInjection(browser);
 
         // Keep network headers, Intl locale and runtime fingerprint hooks aligned with profile settings.
         const applyPageOverrides = async (page) => {
@@ -4868,6 +5107,7 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
                 const session = await page.createCDPSession();
                 try {
                     await session.send('Page.enable');
+                    await session.send('Page.addScriptToEvaluateOnNewDocument', { source: fingerprintInjectScript });
                     await session.send('Page.addScriptToEvaluateOnNewDocument', { source: webglOverrideScript });
                 } catch (e) { }
                 try { await session.send('Network.enable'); } catch (e) { }

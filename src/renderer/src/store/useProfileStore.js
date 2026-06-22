@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia';
 import { ref, computed } from 'vue';
 import { profileService } from '../services/profile.service';
+import { createDuplicateProfilePayload } from '../utils/profile-copy';
 
 export const useProfileStore = defineStore('profile', () => {
     // State
@@ -114,6 +115,17 @@ export const useProfileStore = defineStore('profile', () => {
         }
     };
 
+    const duplicateProfile = async (profile) => {
+        try {
+            const payload = createDuplicateProfilePayload(profile);
+            await profileService.saveProfile(payload);
+            await loadProfiles();
+        } catch (e) {
+            console.error('Failed to duplicate profile:', e);
+            throw e;
+        }
+    };
+
     const deleteProfile = async (id) => {
         try {
             await profileService.deleteProfile(id);
@@ -147,6 +159,7 @@ export const useProfileStore = defineStore('profile', () => {
         isLaunching,
         createProfile,
         updateProfile,
+        duplicateProfile,
         deleteProfile
     };
 });

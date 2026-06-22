@@ -1,6 +1,23 @@
 import { ipcService } from './ipc.service';
 import { decodeBase64Content, getProxyRemark, uuidv4 } from '../utils/helpers';
 
+const MAX_PROXY_LATENCY_BATCH_SIZE = 100;
+const MAX_PROXY_LATENCY_CONCURRENCY = 6;
+
+async function mapWithConcurrency(items, concurrency, worker) {
+    const results = new Array(items.length);
+    let cursor = 0;
+    const runners = Array.from({ length: Math.max(1, Math.min(concurrency, items.length || 1)) }, async () => {
+        while (true) {
+            const index = cursor++;
+            if (index >= items.length) return;
+            results[index] = await worker(items[index], index);
+        }
+    });
+    await Promise.all(runners);
+    return results;
+}
+
 /**
  * 代理与订阅服务 - 处理节点测试、订阅同步与数据解析
  */
@@ -8,12 +25,13 @@ export const proxyService = {
     /**
      * 测试单个节点的延迟
      */
-    async testLatency(url) {
+    async testLatency(url, options = {}) {
         try {
-            const res = await ipcService.invoke('test-proxy-latency', url);
+            const res = await ipcService.invoke('test-proxy-latency', url, options);
             return {
                 success: res.success,
                 latency: res.success ? res.latency : -1,
+                target: res.target || '',
                 error: res.success ? '' : (res.msg || 'Fail')
             };
         } catch (error) {
@@ -24,18 +42,39 @@ export const proxyService = {
     /**
      * 批量测试节点延迟
      */
-    async testBatchLatency(nodes) {
+    async testBatchLatency(nodes, options = {}) {
         try {
             return await ipcService.invoke(
                 'test-proxy-latency-batch',
-                nodes.map((p) => ({ id: p.id, url: p.url }))
+                nodes.map((p) => ({ id: p.id, url: p.url })),
+                options
             );
         } catch (error) {
-            const promises = nodes.map(async (p) => {
-                const res = await this.testLatency(p.url);
+            const fallbackNodes = nodes.slice(0, MAX_PROXY_LATENCY_BATCH_SIZE);
+            return await mapWithConcurrency(fallbackNodes, MAX_PROXY_LATENCY_CONCURRENCY, async (p) => {
+                const res = await this.testLatency(p.url, options);
                 return { id: p.id, ...res };
             });
-            return await Promise.all(promises);
+        }
+    },
+
+    /**
+     * 测试前置代理 + 出口代理链路延迟
+     */
+    async testChainLatency(outboundUrl, preProxyUrl, options = {}) {
+        try {
+            const res = await ipcService.invoke('test-proxy-chain-latency', {
+                outboundUrl,
+                preProxyUrl
+            }, options);
+            return {
+                success: res.success,
+                latency: res.success ? res.latency : -1,
+                target: res.target || '',
+                error: res.success ? '' : (res.msg || 'Fail')
+            };
+        } catch (error) {
+            return { success: false, latency: -1, error: error.message || 'Error' };
         }
     },
 

@@ -7,6 +7,7 @@
   "scripts": {
     "dev": "electron-vite dev",
     "build": "electron-vite build",
+    "test": "node test/proxy-behavior.test.js",
     "postinstall": "node setup.js",
     "build:win": "npm run build && electron-builder --win",
     "build:mac": "npm run build && electron-builder --mac",
@@ -101,7 +102,8 @@
     },
     "linux": {
       "target": "AppImage",
-      "icon": "src/renderer/icon.png"
+      "icon": "src/renderer/icon.png",
+      "category": "Network"
     }
   },
   "dependencies": {

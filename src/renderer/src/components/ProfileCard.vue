@@ -36,6 +36,7 @@
         <div class="actions">
             <button class="no-drag" @click="launch" :disabled="isLaunching">{{ isLaunching ? t('launchingStatus') : t('launch') }}</button>
             <button class="outline no-drag" @click="edit">{{ t('edit') }}</button>
+            <button class="outline no-drag" @click="duplicate">{{ t('duplicate') }}</button>
             <button class="danger no-drag" @click="remove">{{ t('delete') }}</button>
         </div>
     </div>
@@ -80,6 +81,8 @@ const stringToColor = (str) => {
 };
 
 const displayProto = computed(() => {
+    if (props.profile.proxySource === 'direct') return 'DIRECT';
+    if (props.profile.proxySource === 'managed') return 'POOL';
     if (!props.profile.proxyStr) return 'N/A';
     return (props.profile.proxyStr.split('://')[0] || 'UNK').toUpperCase();
 });
@@ -121,6 +124,15 @@ const launch = async () => {
 
 const edit = () => {
     uiStore.openEditModal(props.profile.id);
+};
+
+const duplicate = async () => {
+    try {
+        await profileStore.duplicateProfile(props.profile);
+        uiStore.showAlert(window.t?.('duplicateProfileSuccess') || 'Profile copied');
+    } catch (e) {
+        uiStore.showAlert((window.t?.('duplicateProfileFailed') || 'Copy failed: ') + (e?.message || e));
+    }
 };
 
 const remove = () => {

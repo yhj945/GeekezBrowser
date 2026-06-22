@@ -103,6 +103,10 @@ export const profileService = {
         return await ipcService.invoke('update-profile', profile);
     },
 
+    async previewCanvasFingerprint(data) {
+        return await ipcService.invoke('preview-canvas-fingerprint', data);
+    },
+
     /**
      * 监听环境运行状态变化
      */
