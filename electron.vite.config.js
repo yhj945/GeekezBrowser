@@ -16,7 +16,8 @@ export default defineConfig({
           'profile-proxy': resolve(__dirname, 'src/main/profile-proxy.js'),
           'proxy-probe-targets': resolve(__dirname, 'src/main/proxy-probe-targets.js'),
           'proxy-startup-health-config': resolve(__dirname, 'src/main/proxy-startup-health-config.js'),
-          'launch-args': resolve(__dirname, 'src/main/launch-args.js')
+          'launch-args': resolve(__dirname, 'src/main/launch-args.js'),
+          'dns-leak-protection': resolve(__dirname, 'src/main/dns-leak-protection.js')
         }
       }
     }

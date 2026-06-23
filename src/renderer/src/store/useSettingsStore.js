@@ -8,8 +8,28 @@ const EMPTY_PROXY_STARTUP_HEALTH_CHECK = {
     preProxy: {}
 };
 
+const DEFAULT_DNS_LEAK_PROTECTION = {
+    enabled: true,
+    disableQuic: true,
+    disableDnsPrefetch: true,
+    blockBrowserLocalDns: true,
+    xrayDnsEnabled: false,
+    xrayDnsExplicit: false,
+    dohServers: ['https://1.1.1.1/dns-query', 'https://8.8.8.8/dns-query']
+};
+
 function cloneProxyStartupHealthCheck(value = EMPTY_PROXY_STARTUP_HEALTH_CHECK) {
     return JSON.parse(JSON.stringify(value || EMPTY_PROXY_STARTUP_HEALTH_CHECK));
+}
+
+function cloneDnsLeakProtection(value = DEFAULT_DNS_LEAK_PROTECTION) {
+    const source = value || DEFAULT_DNS_LEAK_PROTECTION;
+    const xrayDnsExplicit = source.xrayDnsExplicit === true;
+    return {
+        ...JSON.parse(JSON.stringify(source)),
+        xrayDnsEnabled: xrayDnsExplicit && source.xrayDnsEnabled === true,
+        xrayDnsExplicit
+    };
 }
 
 export const useSettingsStore = defineStore('settings', {
@@ -27,6 +47,7 @@ export const useSettingsStore = defineStore('settings', {
         currentDataPath: '',
         isDefaultDataPath: true,
         proxyStartupHealthCheck: cloneProxyStartupHealthCheck(),
+        dnsLeakProtection: cloneDnsLeakProtection(),
         activeTab: 'extensions'
     }),
 
@@ -45,6 +66,7 @@ export const useSettingsStore = defineStore('settings', {
                 this.closeBehavior = settings.closeBehavior === 'quit' ? 'quit' : 'tray';
                 this.apiPort = settings.apiPort || 12138;
                 this.proxyStartupHealthCheck = cloneProxyStartupHealthCheck(settings.proxyStartupHealthCheck);
+                this.dnsLeakProtection = cloneDnsLeakProtection(settings.dnsLeakProtection);
                 this.watermarkStyle = settings.watermarkStyle || 'enhanced';
                 localStorage.setItem('geekez_watermark_style', this.watermarkStyle);
 
@@ -155,6 +177,13 @@ export const useSettingsStore = defineStore('settings', {
         async saveProxyStartupHealthCheck(config) {
             const settings = await ipcService.getSettings();
             settings.proxyStartupHealthCheck = cloneProxyStartupHealthCheck(config);
+            await ipcService.saveSettings(settings);
+            await this.loadSettings();
+        },
+
+        async saveDnsLeakProtection(config) {
+            const settings = await ipcService.getSettings();
+            settings.dnsLeakProtection = cloneDnsLeakProtection(config);
             await ipcService.saveSettings(settings);
             await this.loadSettings();
         },

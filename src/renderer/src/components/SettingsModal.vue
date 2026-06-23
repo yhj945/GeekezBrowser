@@ -322,6 +322,52 @@
                         </div>
                     </div>
 
+                    <!-- DNS Leak Protection Section -->
+                    <div style="margin-bottom: 25px;">
+                        <h4 style="margin-bottom:10px; color:var(--text-primary); font-size:14px;"
+                            data-i18n="dnsLeakProtectionTitle">{{ $t('dnsLeakProtectionTitle') }}</h4>
+                        <p style="font-size:12px; opacity:0.7; margin-bottom:15px;" data-i18n="dnsLeakProtectionDesc">
+                            {{ $t('dnsLeakProtectionDesc') }}
+                        </p>
+
+                        <div style="border:1px solid var(--border); border-radius:8px; padding:12px; background:rgba(0,0,0,0.12);">
+                            <label style="display:flex; align-items:center; gap:10px; margin-bottom:10px; font-size:12px; color:var(--text-primary);">
+                                <input type="checkbox" v-model="tempDnsLeakProtection.enabled" style="width:auto; margin:0;">
+                                <span>{{ $t('dnsLeakProtectionEnable') }}</span>
+                            </label>
+                            <label style="display:flex; align-items:center; gap:10px; margin-bottom:10px; font-size:12px; color:var(--text-secondary);">
+                                <input type="checkbox" v-model="tempDnsLeakProtection.disableQuic" :disabled="!tempDnsLeakProtection.enabled" style="width:auto; margin:0;">
+                                <span>{{ $t('dnsLeakProtectionDisableQuic') }}</span>
+                            </label>
+                            <label style="display:flex; align-items:center; gap:10px; margin-bottom:10px; font-size:12px; color:var(--text-secondary);">
+                                <input type="checkbox" v-model="tempDnsLeakProtection.disableDnsPrefetch" :disabled="!tempDnsLeakProtection.enabled" style="width:auto; margin:0;">
+                                <span>{{ $t('dnsLeakProtectionDisablePrefetch') }}</span>
+                            </label>
+                            <label style="display:flex; align-items:center; gap:10px; margin-bottom:10px; font-size:12px; color:var(--text-secondary);">
+                                <input type="checkbox" v-model="tempDnsLeakProtection.blockBrowserLocalDns" :disabled="!tempDnsLeakProtection.enabled" style="width:auto; margin:0;">
+                                <span>{{ $t('dnsLeakProtectionBlockLocal') }}</span>
+                            </label>
+                            <label style="display:flex; align-items:center; gap:10px; margin-bottom:12px; font-size:12px; color:var(--text-secondary);">
+                                <input type="checkbox" v-model="tempDnsLeakProtection.xrayDnsEnabled" :disabled="!tempDnsLeakProtection.enabled" style="width:auto; margin:0;">
+                                <span>{{ $t('dnsLeakProtectionXrayDns') }}</span>
+                            </label>
+                            <label style="display:flex; flex-direction:column; gap:6px; font-size:12px; color:var(--text-secondary);">
+                                <span>{{ $t('dnsLeakProtectionDohServers') }}</span>
+                                <textarea v-model="tempDnsLeakProtection.dohServersText" :disabled="!tempDnsLeakProtection.enabled || !tempDnsLeakProtection.xrayDnsEnabled"
+                                    style="min-height:76px; resize:vertical; margin:0; font-family:monospace; font-size:11px;"
+                                    placeholder="https://1.1.1.1/dns-query\nhttps://8.8.8.8/dns-query"></textarea>
+                            </label>
+                            <div style="font-size:11px; color:var(--text-secondary); opacity:0.8; margin-top:8px; line-height:1.5;">
+                                {{ $t('dnsLeakProtectionHint') }}
+                            </div>
+                            <div style="display:flex; justify-content:flex-end; margin-top:14px;">
+                                <button class="outline" @click="handleSaveDnsLeakProtection" style="font-size:12px;">
+                                    {{ $t('save') }}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- Watermark Style Section -->
                     <div style="margin-bottom: 25px;">
                         <h4 style="margin-bottom:10px; color:var(--text-primary); font-size:14px;"
@@ -435,6 +481,15 @@ const tempProxyStartupHealthCheck = ref({
     direct: {},
     preProxy: {}
 });
+const tempDnsLeakProtection = ref({
+    enabled: true,
+    disableQuic: true,
+    disableDnsPrefetch: true,
+    blockBrowserLocalDns: true,
+    xrayDnsEnabled: false,
+    xrayDnsExplicit: false,
+    dohServersText: ''
+});
 const showRestartWarning = ref(false);
 const showStoreSearch = ref(false);
 const storeSearchQuery = ref('');
@@ -461,6 +516,18 @@ const proxyHealthFields = [
 ];
 
 const cloneProxyStartupHealthCheck = (value) => JSON.parse(JSON.stringify(value || {}));
+const cloneDnsLeakProtectionForForm = (value = {}) => {
+    const dohServers = Array.isArray(value.dohServers) ? value.dohServers : [];
+    return {
+        enabled: value.enabled !== false,
+        disableQuic: value.disableQuic !== false,
+        disableDnsPrefetch: value.disableDnsPrefetch !== false,
+        blockBrowserLocalDns: value.blockBrowserLocalDns !== false,
+        xrayDnsEnabled: value.xrayDnsExplicit === true && value.xrayDnsEnabled === true,
+        xrayDnsExplicit: value.xrayDnsExplicit === true,
+        dohServersText: dohServers.join('\n')
+    };
+};
 
 onMounted(async () => {
     settingService.onExtensionInstallProgress((payload) => {
@@ -484,6 +551,10 @@ watch(() => settingsStore.apiPort, (newVal) => {
 
 watch(() => settingsStore.proxyStartupHealthCheck, (newVal) => {
     tempProxyStartupHealthCheck.value = cloneProxyStartupHealthCheck(newVal);
+}, { immediate: true, deep: true });
+
+watch(() => settingsStore.dnsLeakProtection, (newVal) => {
+    tempDnsLeakProtection.value = cloneDnsLeakProtectionForForm(newVal);
 }, { immediate: true, deep: true });
 
 const handleSelectExtension = async () => {
@@ -677,6 +748,24 @@ const handleSaveApiPort = async () => {
 const handleSaveProxyStartupHealthCheck = async () => {
     await settingsStore.saveProxyStartupHealthCheck(tempProxyStartupHealthCheck.value);
     uiStore.showAlert(window.t('proxyHealthSaved'));
+};
+
+const handleSaveDnsLeakProtection = async () => {
+    const form = tempDnsLeakProtection.value || {};
+    const dohServers = String(form.dohServersText || '')
+        .split(/[\r\n,]+/)
+        .map(value => value.trim())
+        .filter(Boolean);
+    await settingsStore.saveDnsLeakProtection({
+        enabled: form.enabled !== false,
+        disableQuic: form.disableQuic !== false,
+        disableDnsPrefetch: form.disableDnsPrefetch !== false,
+        blockBrowserLocalDns: form.blockBrowserLocalDns !== false,
+        xrayDnsEnabled: form.xrayDnsEnabled === true,
+        xrayDnsExplicit: true,
+        dohServers
+    });
+    uiStore.showAlert(window.t('dnsLeakProtectionSaved'));
 };
 
 const handleOpenApiDocs = () => {

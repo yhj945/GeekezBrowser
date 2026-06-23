@@ -22,8 +22,17 @@ const {
   DEFAULT_PROXY_STARTUP_HEALTH_CONFIG,
   normalizeProxyStartupHealthConfig
 } = require('../src/main/proxy-startup-health-config');
-const { parseCustomLaunchArgs } = require('../src/main/launch-args');
+const { filterManagedLaunchArgs, parseCustomLaunchArgs } = require('../src/main/launch-args');
 const { resolveChromiumPath } = require('../src/main/chromium-path');
+const {
+  DEFAULT_DOH_SERVERS,
+  HOST_RESOLVER_RULES,
+  STRICT_DNS_LEAK_PROTECTION_LAUNCH_ARGS,
+  DNS_LEAK_PROTECTION_DISABLED_FEATURES,
+  normalizeDnsLeakProtectionConfig,
+  buildDnsLeakProtectionLaunchArgs,
+  getDnsLeakProtectionDisabledFeatures
+} = require('../src/main/dns-leak-protection');
 
 let generateXrayConfig;
 let parseProxyLink;
@@ -40,8 +49,14 @@ function loadMainUtilsForTest() {
   const utilsPath = path.join(__dirname, '..', 'src', 'main', 'utils.js');
   const source = fs.readFileSync(utilsPath, 'utf8')
     .replace(/export \{ generateXrayConfig, parseProxyLink, getProxyRemark \};\s*$/, 'module.exports = { generateXrayConfig, parseProxyLink, getProxyRemark };');
+  const localRequire = (moduleName) => {
+    if (moduleName === './dns-leak-protection') {
+      return require('../src/main/dns-leak-protection');
+    }
+    return require(moduleName);
+  };
   const sandbox = {
-    require,
+    require: localRequire,
     module: { exports: {} },
     exports: {},
     Buffer,
@@ -519,7 +534,7 @@ function testMainProxyKeepsExplicitFingerprint() {
     makeVmessLink({ address: 'vmess-main.example.com', id: '22222222-2222-2222-2222-222222222222', fingerprint: 'firefox' }),
     24079,
     null,
-    { uaMode: 'spoof', browserType: 'edge', browserMajorVersion: 147 }
+    { uaMode: 'spoof', browserType: 'edge', browserMajorVersion: 149 }
   );
   const vmessMainOutbound = findOutbound(vmessMainConfig, 'proxy_main');
   assert.strictEqual(vmessMainOutbound.streamSettings.tlsSettings.fingerprint, 'firefox');
@@ -528,7 +543,7 @@ function testMainProxyKeepsExplicitFingerprint() {
     'trojan://password@trojan-main.example.com:443?security=tls&type=tcp&sni=trojan-main.example.com&fp=safari',
     24078,
     null,
-    { uaMode: 'spoof', browserType: 'chrome', browserMajorVersion: 147 }
+    { uaMode: 'spoof', browserType: 'chrome', browserMajorVersion: 149 }
   );
   const trojanMainOutbound = findOutbound(trojanMainConfig, 'proxy_main');
   assert.strictEqual(trojanMainOutbound.streamSettings.tlsSettings.fingerprint, 'safari');
@@ -542,7 +557,7 @@ function testChainedXrayConfigKeepsPreProxyFingerprint() {
     mainProxy,
     24080,
     { preProxies: [{ id: 'profile-pre', url: preProxy }] },
-    { uaMode: 'spoof', browserType: 'chrome', browserMajorVersion: 147 }
+    { uaMode: 'spoof', browserType: 'chrome', browserMajorVersion: 149 }
   );
 
   const mainOutbound = findOutbound(config, 'proxy_main');
@@ -556,7 +571,7 @@ function testChainedXrayConfigKeepsPreProxyFingerprint() {
     mainProxy,
     24081,
     { preProxies: [{ id: 'vmess-pre', url: makeVmessLink({ address: 'vmess-pre.example.com', id: '11111111-1111-1111-1111-111111111111', fingerprint: 'firefox' }) }] },
-    { uaMode: 'spoof', browserType: 'edge', browserMajorVersion: 147 }
+    { uaMode: 'spoof', browserType: 'edge', browserMajorVersion: 149 }
   );
   const vmessPreOutbound = findOutbound(vmessPreConfig, 'proxy_pre');
   assert.strictEqual(vmessPreOutbound.streamSettings.tlsSettings.fingerprint, 'firefox');
@@ -568,7 +583,7 @@ function testChainedXrayConfigAddsMissingPreProxyFingerprint() {
     mainProxy,
     24082,
     { preProxies: [{ id: 'vmess-pre', url: makeVmessLink({ address: 'vmess-pre.example.com', id: '33333333-3333-3333-3333-333333333333', fingerprint: null }) }] },
-    { uaMode: 'spoof', browserType: 'edge', browserMajorVersion: 147 }
+    { uaMode: 'spoof', browserType: 'edge', browserMajorVersion: 149 }
   );
 
   const preOutbound = findOutbound(config, 'proxy_pre');
@@ -590,6 +605,58 @@ function testMissingFingerprintFallbackDoesNotDependOnUaMode() {
   assert.strictEqual(preOutbound.streamSettings.tlsSettings.fingerprint, 'chrome');
 }
 
+function testDnsLeakProtectionDefaultsAndLaunchArgs() {
+  const normalized = normalizeDnsLeakProtectionConfig({});
+  assert.strictEqual(normalized.enabled, true);
+  assert.deepStrictEqual(normalized.dohServers, DEFAULT_DOH_SERVERS);
+
+  const argsWithoutProxy = buildDnsLeakProtectionLaunchArgs(normalized, { hasLocalProxy: false });
+  assert.deepStrictEqual(argsWithoutProxy, []);
+
+  const argsWithProxy = buildDnsLeakProtectionLaunchArgs(normalized, { hasLocalProxy: true });
+  assert.ok(argsWithProxy.includes('--disable-quic'));
+  assert.ok(argsWithProxy.includes('--dns-prefetch-disable'));
+  assert.ok(argsWithProxy.includes(`--host-resolver-rules=${HOST_RESOLVER_RULES}`));
+  for (const arg of STRICT_DNS_LEAK_PROTECTION_LAUNCH_ARGS) {
+    assert.ok(argsWithProxy.includes(arg));
+  }
+
+  const sanitized = normalizeDnsLeakProtectionConfig({
+    dohServers: ['http://plain.example/dns-query', 'https://dns.example/dns-query', 'https://dns.example/dns-query']
+  });
+  assert.deepStrictEqual(sanitized.dohServers, ['https://dns.example/dns-query']);
+  assert.strictEqual(normalizeDnsLeakProtectionConfig({ xrayDnsEnabled: true }).xrayDnsEnabled, false);
+  assert.strictEqual(normalizeDnsLeakProtectionConfig({ xrayDnsEnabled: true, xrayDnsExplicit: true }).xrayDnsEnabled, true);
+}
+
+function testGenerateXrayConfigAddsDnsLeakProtection() {
+  const config = generateXrayConfig(
+    'vless://main-user@main.example.com:443?security=tls&type=tcp&sni=main.example.com&fp=chrome',
+    24085,
+    null,
+    { uaMode: 'spoof', browserType: 'chrome', browserMajorVersion: 149 },
+    { enabled: true, xrayDnsEnabled: true, xrayDnsExplicit: true, dohServers: ['https://dns.example/dns-query'] }
+  );
+
+  assert.deepStrictEqual(config.dns, {
+    queryStrategy: 'UseIPv4',
+    disableFallback: true,
+    disableFallbackIfMatch: true,
+    servers: [{ address: 'https://dns.example/dns-query' }]
+  });
+  assert.strictEqual(findOutbound(config, 'proxy_main').streamSettings.sockopt.domainStrategy, 'UseIPv4');
+
+  const disabledConfig = generateXrayConfig(
+    'vless://main-user@main.example.com:443?security=tls&type=tcp&sni=main.example.com&fp=chrome',
+    24086,
+    null,
+    { uaMode: 'spoof', browserType: 'chrome', browserMajorVersion: 149 },
+    { enabled: false, xrayDnsEnabled: true, xrayDnsExplicit: true, dohServers: ['https://dns.example/dns-query'] }
+  );
+  assert.strictEqual(disabledConfig.dns, undefined);
+  assert.strictEqual(findOutbound(disabledConfig, 'proxy_main').streamSettings.sockopt?.domainStrategy, undefined);
+}
+
 function testGenerateXrayConfigFailsClosedWhenPreProxyInvalid() {
   const mainProxy = 'vless://main-user@main.example.com:443?security=tls&type=tcp&sni=main.example.com&fp=chrome';
   assert.throws(
@@ -597,7 +664,7 @@ function testGenerateXrayConfigFailsClosedWhenPreProxyInvalid() {
       mainProxy,
       24084,
       { preProxies: [{ id: 'bad-pre', url: 'unsupported://user:secret@example.com:443' }] },
-      { uaMode: 'spoof', browserType: 'chrome', browserMajorVersion: 147 }
+      { uaMode: 'spoof', browserType: 'chrome', browserMajorVersion: 149 }
     ),
     /Unsupported protocol/
   );
@@ -827,10 +894,40 @@ function testBrowserLaunchKeepsExtensionsEnabled() {
   assert.match(source, /ignoreDefaultArgs:\s*\[[^\]]*['"]--disable-extensions['"]/s);
 }
 
+function testLocalXrayProxyDisablesQuic() {
+  const indexPath = path.join(__dirname, '..', 'src', 'main', 'index.js');
+  const source = fs.readFileSync(indexPath, 'utf8');
+  const localProxyBranchStart = source.indexOf('        if (localPort) {');
+  const directBranchStart = source.indexOf('        } else {', localProxyBranchStart);
+  const nextLaunchSectionStart = source.indexOf('        if (profile.fingerprint?.userAgent)', directBranchStart);
+
+  assert.notStrictEqual(localProxyBranchStart, -1);
+  assert.notStrictEqual(directBranchStart, -1);
+  assert.notStrictEqual(nextLaunchSectionStart, -1);
+
+  const localProxyBranch = source.slice(localProxyBranchStart, directBranchStart);
+  const directBranch = source.slice(directBranchStart, nextLaunchSectionStart);
+
+  assert.ok(localProxyBranch.includes("launchArgs.push('--disable-quic');"));
+  assert.ok(localProxyBranch.includes(".filter(arg => arg !== '--disable-quic')"));
+  assert.ok(localProxyBranch.includes('getDnsLeakProtectionDisabledFeatures'));
+  assert.deepStrictEqual(
+    getDnsLeakProtectionDisabledFeatures({}, { hasLocalProxy: true }),
+    DNS_LEAK_PROTECTION_DISABLED_FEATURES
+  );
+  assert.deepStrictEqual(getDnsLeakProtectionDisabledFeatures({}, { hasLocalProxy: false }), []);
+  assert.strictEqual(directBranch.includes("--disable-quic"), false);
+}
+
 function testCustomLaunchArgsCannotOverrideManagedExtensionArgs() {
-  const args = parseCustomLaunchArgs('--load-extension --disable-extensions-except=/tmp/other --lang=en-US --foo=bar');
+  const args = parseCustomLaunchArgs('--load-extension --disable-extensions-except=/tmp/other --proxy-server=socks5://127.0.0.1:12345 --no-proxy-server --proxy-bypass-list=<-loopback> --proxy-pac-url=http://proxy.local/pac --proxy-auto-detect --disable-quic --enable-quic --dns-prefetch-disable --host-resolver-rules=MAP_ALL --disable-async-dns --disable-ipv6 --disable-features=AsyncDns --enable-features=AsyncDns --lang=en-US --foo=bar');
 
   assert.deepStrictEqual(args, ['--lang=en-US', '--foo=bar']);
+  assert.deepStrictEqual(filterManagedLaunchArgs(['--proxy-server=socks5://127.0.0.1:12345', '--host-resolver-rules=MAP_ALL', '--disable-async-dns', '--disable-ipv6', '--disable-features=AsyncDns', '--enable-features=AsyncDns', '--lang=en-US']), ['--lang=en-US']);
+
+  const indexPath = path.join(__dirname, '..', 'src', 'main', 'index.js');
+  const source = fs.readFileSync(indexPath, 'utf8');
+  assert.ok(source.includes('return filterManagedLaunchArgs(normalizedArgs);'));
 }
 
 function testBundledChromiumZipIsExtractedBeforeSystemChromeFallback() {
@@ -924,6 +1021,27 @@ function testMainProcessInstallsCdpFingerprintTargetInjection() {
   assert.ok(block.indexOf('await applyFingerprintTargetSession(childSession, event.targetInfo || {})') < block.indexOf('await runIfWaitingForDebugger(childSession)'));
 }
 
+function testChromeVersionPoolsIncludeLatestOptions() {
+  const fingerprint149 = generateFingerprint({ uaMode: 'spoof', browserType: 'chrome', browserMajorVersion: 149 });
+  const fingerprint148 = generateFingerprint({ uaMode: 'spoof', browserType: 'chrome', browserMajorVersion: 148 });
+
+  assert.strictEqual(fingerprint149.browserMajorVersion, 149);
+  assert.strictEqual(fingerprint149.browserFullVersion, '149.0.0.0');
+  assert.ok(fingerprint149.userAgent.includes('Chrome/149.0.0.0'));
+  assert.strictEqual(fingerprint148.browserMajorVersion, 148);
+  assert.strictEqual(fingerprint148.browserFullVersion, '148.0.0.0');
+
+  const optionsPath = path.join(__dirname, '..', 'src', 'renderer', 'src', 'utils', 'fingerprintOptions.js');
+  const optionsSource = fs.readFileSync(optionsPath, 'utf8');
+  assert.ok(optionsSource.includes('const major = 149 - i'));
+  assert.ok(optionsSource.includes('length: 21'));
+
+  const indexPath = path.join(__dirname, '..', 'src', 'main', 'index.js');
+  const indexSource = fs.readFileSync(indexPath, 'utf8');
+  assert.ok(indexSource.includes('Chrome/149.0.0.0'));
+  assert.ok(indexSource.includes('prodversion=149.0.0.0'));
+}
+
 function testMainProcessKeepsSeedLifecycleGuards() {
   const indexPath = path.join(__dirname, '..', 'src', 'main', 'index.js');
   const source = fs.readFileSync(indexPath, 'utf8');
@@ -1012,6 +1130,8 @@ function main() {
   testChainedXrayConfigKeepsPreProxyFingerprint();
   testChainedXrayConfigAddsMissingPreProxyFingerprint();
   testMissingFingerprintFallbackDoesNotDependOnUaMode();
+  testDnsLeakProtectionDefaultsAndLaunchArgs();
+  testGenerateXrayConfigAddsDnsLeakProtection();
   testGenerateXrayConfigFailsClosedWhenPreProxyInvalid();
   testParseProxyLinkDoesNotLogRawCredentials();
   testParseProxyLinkThrowsSanitizedInvalidUrlError();
@@ -1019,10 +1139,12 @@ function main() {
   testCanvasFingerprintScriptCoversSerializationAndWebglReadback();
   testWorkerFingerprintScriptIsSeparateFromPageWorkerWrapping();
   testBrowserLaunchKeepsExtensionsEnabled();
+  testLocalXrayProxyDisablesQuic();
   testCustomLaunchArgsCannotOverrideManagedExtensionArgs();
   testBundledChromiumZipIsExtractedBeforeSystemChromeFallback();
   testMainProcessInstallsCdpFingerprintTargetInjection();
   testMainProcessKeepsSeedLifecycleGuards();
+  testChromeVersionPoolsIncludeLatestOptions();
   testProfileScopedNoiseSeedMakesCopiedProfilesDifferent();
   testProfileNoiseSeedLifecycleIsStableUntilRotated();
   testCanvasFingerprintPreviewIsDeterministicAndNonLaunching();
