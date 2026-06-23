@@ -322,6 +322,62 @@
                         </div>
                     </div>
 
+                    <!-- Proxy Core Section -->
+                    <div style="margin-bottom: 25px;">
+                        <h4 style="margin-bottom:10px; color:var(--text-primary); font-size:14px;"
+                            data-i18n="proxyCoreTitle">{{ $t('proxyCoreTitle') }}</h4>
+                        <p style="font-size:12px; opacity:0.7; margin-bottom:15px;" data-i18n="proxyCoreDesc">
+                            {{ $t('proxyCoreDesc') }}
+                        </p>
+
+                        <div style="border:1px solid var(--border); border-radius:8px; padding:12px; background:rgba(0,0,0,0.12);">
+                            <label style="display:flex; flex-direction:column; gap:6px; font-size:12px; color:var(--text-secondary);">
+                                <span>{{ $t('proxyCoreSelectLabel') }}</span>
+                                <select v-model="tempProxyCore.type" style="max-width:320px; margin:0;">
+                                    <option value="xray">{{ $t('proxyCoreXray') }}</option>
+                                    <option value="sing-box">{{ $t('proxyCoreSingBox') }}</option>
+                                </select>
+                            </label>
+
+                            <div v-if="tempProxyCore.type === 'sing-box'" style="margin-top:12px; display:flex; flex-direction:column; gap:10px;">
+                                <label style="display:flex; align-items:center; gap:10px; font-size:12px; color:var(--text-secondary);">
+                                    <input type="checkbox" v-model="tempProxyCore.singBox.dnsEnabled" style="width:auto; margin:0;">
+                                    <span>{{ $t('singBoxDnsEnable') }}</span>
+                                </label>
+                                <label style="display:flex; align-items:center; gap:10px; font-size:12px; color:var(--text-secondary);">
+                                    <input type="checkbox" v-model="tempProxyCore.singBox.enableDnsThroughProxy" :disabled="!tempProxyCore.singBox.dnsEnabled" style="width:auto; margin:0;">
+                                    <span>{{ $t('singBoxDnsThroughProxy') }}</span>
+                                </label>
+                                <label style="display:flex; flex-direction:column; gap:6px; font-size:12px; color:var(--text-secondary);">
+                                    <span>{{ $t('singBoxDnsStrategy') }}</span>
+                                    <select v-model="tempProxyCore.singBox.dnsStrategy" :disabled="!tempProxyCore.singBox.dnsEnabled" style="max-width:220px; margin:0;">
+                                        <option value="ipv4_only">IPv4 only</option>
+                                        <option value="prefer_ipv4">Prefer IPv4</option>
+                                        <option value="prefer_ipv6">Prefer IPv6</option>
+                                        <option value="as_is">As-is</option>
+                                    </select>
+                                </label>
+                                <label style="display:flex; flex-direction:column; gap:6px; font-size:12px; color:var(--text-secondary);">
+                                    <span>{{ $t('singBoxDnsServers') }}</span>
+                                    <textarea v-model="tempProxyCore.singBox.remoteDnsServersText" :disabled="!tempProxyCore.singBox.dnsEnabled"
+                                        style="min-height:76px; resize:vertical; margin:0; font-family:monospace; font-size:11px;"
+                                        placeholder="https://dns.example/dns-query"></textarea>
+                                </label>
+                                <div style="font-size:11px; color:var(--text-secondary); opacity:0.8; line-height:1.5;">
+                                    {{ $t('singBoxDnsHint') }}
+                                </div>
+                            </div>
+                            <div style="font-size:11px; color:var(--text-secondary); opacity:0.8; margin-top:8px; line-height:1.5;">
+                                {{ $t('proxyCoreRestartHint') }}
+                            </div>
+                            <div style="display:flex; justify-content:flex-end; margin-top:14px;">
+                                <button class="outline" @click="handleSaveProxyCore" style="font-size:12px;">
+                                    {{ $t('save') }}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- DNS Leak Protection Section -->
                     <div style="margin-bottom: 25px;">
                         <h4 style="margin-bottom:10px; color:var(--text-primary); font-size:14px;"
@@ -348,15 +404,18 @@
                                 <span>{{ $t('dnsLeakProtectionBlockLocal') }}</span>
                             </label>
                             <label style="display:flex; align-items:center; gap:10px; margin-bottom:12px; font-size:12px; color:var(--text-secondary);">
-                                <input type="checkbox" v-model="tempDnsLeakProtection.xrayDnsEnabled" :disabled="!tempDnsLeakProtection.enabled" style="width:auto; margin:0;">
+                                <input type="checkbox" v-model="tempDnsLeakProtection.xrayDnsEnabled" :disabled="!tempDnsLeakProtection.enabled || isSingBoxDefaultCore" style="width:auto; margin:0;">
                                 <span>{{ $t('dnsLeakProtectionXrayDns') }}</span>
                             </label>
                             <label style="display:flex; flex-direction:column; gap:6px; font-size:12px; color:var(--text-secondary);">
                                 <span>{{ $t('dnsLeakProtectionDohServers') }}</span>
-                                <textarea v-model="tempDnsLeakProtection.dohServersText" :disabled="!tempDnsLeakProtection.enabled || !tempDnsLeakProtection.xrayDnsEnabled"
+                                <textarea v-model="tempDnsLeakProtection.dohServersText" :disabled="!tempDnsLeakProtection.enabled || !tempDnsLeakProtection.xrayDnsEnabled || isSingBoxDefaultCore"
                                     style="min-height:76px; resize:vertical; margin:0; font-family:monospace; font-size:11px;"
                                     placeholder="https://1.1.1.1/dns-query\nhttps://8.8.8.8/dns-query"></textarea>
                             </label>
+                            <div v-if="isSingBoxDefaultCore" style="font-size:11px; color:var(--text-secondary); opacity:0.9; margin-top:8px; line-height:1.5;">
+                                {{ $t('dnsLeakProtectionSingBoxHint') }}
+                            </div>
                             <div style="font-size:11px; color:var(--text-secondary); opacity:0.8; margin-top:8px; line-height:1.5;">
                                 {{ $t('dnsLeakProtectionHint') }}
                             </div>
@@ -466,7 +525,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, watch } from 'vue';
+import { computed, ref, onMounted, watch } from 'vue';
 import { useUIStore } from '../store/useUIStore';
 import { useSettingsStore } from '../store/useSettingsStore';
 import { settingService } from '../services/setting.service';
@@ -490,6 +549,19 @@ const tempDnsLeakProtection = ref({
     xrayDnsExplicit: false,
     dohServersText: ''
 });
+const tempProxyCore = ref({
+    type: 'xray',
+    singBox: {
+        dnsEnabled: true,
+        dnsStrategy: 'ipv4_only',
+        finalDnsTag: 'remote-dns',
+        remoteDnsServersText: '',
+        enableDnsThroughProxy: true,
+        strictRoute: true,
+        disableCache: false,
+        independentCache: true
+    }
+});
 const showRestartWarning = ref(false);
 const showStoreSearch = ref(false);
 const storeSearchQuery = ref('');
@@ -501,6 +573,7 @@ const installingStoreId = ref('');
 const installProgressPercent = ref(0);
 const installProgressMessage = ref('');
 const scopeGroupState = ref({});
+const isSingBoxDefaultCore = computed(() => tempProxyCore.value?.type === 'sing-box');
 
 const proxyHealthPhases = [
     { key: 'direct', labelKey: 'proxyHealthDirectPhase' },
@@ -526,6 +599,24 @@ const cloneDnsLeakProtectionForForm = (value = {}) => {
         xrayDnsEnabled: value.xrayDnsExplicit === true && value.xrayDnsEnabled === true,
         xrayDnsExplicit: value.xrayDnsExplicit === true,
         dohServersText: dohServers.join('\n')
+    };
+};
+
+const cloneProxyCoreForForm = (value = {}) => {
+    const singBox = value.singBox || {};
+    const servers = Array.isArray(singBox.remoteDnsServers) ? singBox.remoteDnsServers : [];
+    return {
+        type: value.type === 'sing-box' ? 'sing-box' : 'xray',
+        singBox: {
+            dnsEnabled: singBox.dnsEnabled !== false && singBox.enabled !== false,
+            dnsStrategy: singBox.dnsStrategy || singBox.strategy || 'ipv4_only',
+            finalDnsTag: singBox.finalDnsTag || 'remote-dns',
+            remoteDnsServersText: servers.join('\n'),
+            enableDnsThroughProxy: singBox.enableDnsThroughProxy !== false,
+            strictRoute: singBox.strictRoute !== false,
+            disableCache: singBox.disableCache === true,
+            independentCache: singBox.independentCache !== false
+        }
     };
 };
 
@@ -555,6 +646,10 @@ watch(() => settingsStore.proxyStartupHealthCheck, (newVal) => {
 
 watch(() => settingsStore.dnsLeakProtection, (newVal) => {
     tempDnsLeakProtection.value = cloneDnsLeakProtectionForForm(newVal);
+}, { immediate: true, deep: true });
+
+watch(() => settingsStore.proxyCore, (newVal) => {
+    tempProxyCore.value = cloneProxyCoreForForm(newVal);
 }, { immediate: true, deep: true });
 
 const handleSelectExtension = async () => {
@@ -766,6 +861,29 @@ const handleSaveDnsLeakProtection = async () => {
         dohServers
     });
     uiStore.showAlert(window.t('dnsLeakProtectionSaved'));
+};
+
+const handleSaveProxyCore = async () => {
+    const form = tempProxyCore.value || {};
+    const singBox = form.singBox || {};
+    const remoteDnsServers = String(singBox.remoteDnsServersText || '')
+        .split(/[\r\n,]+/)
+        .map(value => value.trim())
+        .filter(Boolean);
+    await settingsStore.saveProxyCore({
+        type: form.type === 'sing-box' ? 'sing-box' : 'xray',
+        singBox: {
+            dnsEnabled: singBox.dnsEnabled !== false,
+            dnsStrategy: singBox.dnsStrategy || 'ipv4_only',
+            finalDnsTag: singBox.finalDnsTag || 'remote-dns',
+            remoteDnsServers,
+            enableDnsThroughProxy: singBox.enableDnsThroughProxy !== false,
+            strictRoute: singBox.strictRoute !== false,
+            disableCache: singBox.disableCache === true,
+            independentCache: singBox.independentCache !== false
+        }
+    });
+    uiStore.showAlert(window.t('proxyCoreSaved'));
 };
 
 const handleOpenApiDocs = () => {

@@ -18,7 +18,8 @@ export const useProxyStore = defineStore('proxy', () => {
         enableOutboundProxy: false,
         outboundMode: 'single',
         selectedOutboundId: null,
-        proxyProbeUrls: ''
+        proxyProbeUrls: '',
+        proxyCore: null
     });
     const currentGroup = ref('manual');
     const testingIds = ref(new Set());
@@ -93,9 +94,14 @@ export const useProxyStore = defineStore('proxy', () => {
         return activeNodes[0]?.url || '';
     };
 
-    const getProbeOptions = () => ({
-        proxyProbeUrls: settings.value.proxyProbeUrls || ''
-    });
+    const getProbeOptions = () => {
+        const options = {
+            proxyProbeUrls: settings.value.proxyProbeUrls || ''
+        };
+        const proxyCoreType = settings.value.proxyCore?.type;
+        if (proxyCoreType) options.proxyCoreType = proxyCoreType;
+        return options;
+    };
 
     const setTesting = (id, active) => {
         const next = new Set(testingIds.value);

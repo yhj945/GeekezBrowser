@@ -21,6 +21,16 @@ const { normalizeProxyStartupHealthConfig } = require('./proxy-startup-health-co
 const { isDirectProxy, normalizeProfileProxyFields, normalizeProfilePreProxyFields, normalizeOutboundProxyFields, resolveProfileProxy, resolveProfilePreProxy } = require('./profile-proxy');
 const { normalizeDnsLeakProtectionConfig, buildDnsLeakProtectionLaunchArgs, getDnsLeakProtectionDisabledFeatures } = require('./dns-leak-protection');
 const { filterManagedLaunchArgs, parseCustomLaunchArgs } = require('./launch-args');
+const {
+    PROXY_CORE_TYPES,
+    resolveProxyCoreType,
+    getProxyCoreSettings,
+    generateProxyCoreConfig,
+    getProxyCoreSpawnOptions,
+    getProxyCoreLogName,
+    getProxyCoreConfigName,
+    getProxyCoreProcessLabel
+} = require('./proxy-core/proxy-core-runtime');
 const gzip = promisify(zlib.gzip);
 const gunzip = promisify(zlib.gunzip);
 const initSqlJs = require('sql.js');
@@ -69,7 +79,7 @@ async function createSocksProxyAgent(proxyUrl) {
 // Hardware acceleration enabled for better UI performance
 // Only disable if GPU compatibility issues occur
 
-import { generateXrayConfig, parseProxyLink, getProxyRemark } from './utils';
+const { parseProxyLink, getProxyRemark } = require('./utils');
 import { generateFingerprint, getInjectScript, getGeolocationScript, getWorkerInjectScript, getWatermarkScript, ensureProfileScopedNoiseSeed, rotateProfileNoiseSeed, buildCanvasFingerprintPreview } from './fingerprint';
 const isDev = !app.isPackaged;
 const RESOURCES_BIN = isDev ? path.join(app.getAppPath(), 'resources', 'bin') : path.join(process.resourcesPath, 'bin');
@@ -1153,6 +1163,7 @@ function normalizeSettingsSnapshot(settings) {
     nextSettings.proxyProbeUrls = String(nextSettings.proxyProbeUrls || '').trim();
     nextSettings.proxyStartupHealthCheck = normalizeProxyStartupHealthConfig(nextSettings);
     nextSettings.dnsLeakProtection = normalizeDnsLeakProtectionConfig(nextSettings.dnsLeakProtection);
+    nextSettings.proxyCore = getProxyCoreSettings(nextSettings);
     nextSettings.lang = nextSettings.lang === 'en' ? 'en' : 'cn';
     nextSettings.enablePreProxy = !!nextSettings.enablePreProxy;
     nextSettings.notify = !!nextSettings.notify;
@@ -1409,6 +1420,13 @@ function normalizeDebugPort(rawPort) {
     return parsed;
 }
 
+function normalizeProfileProxyCoreOverride(value, fallback = 'inherit') {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (normalized === PROXY_CORE_TYPES.XRAY) return PROXY_CORE_TYPES.XRAY;
+    if (normalized === PROXY_CORE_TYPES.SING_BOX || normalized === 'singbox') return PROXY_CORE_TYPES.SING_BOX;
+    return fallback === PROXY_CORE_TYPES.XRAY || fallback === PROXY_CORE_TYPES.SING_BOX ? fallback : 'inherit';
+}
+
 function hasRestorableSession(userDataDir) {
     const defaultDir = path.join(userDataDir, 'Default');
     const sessionsDir = path.join(defaultDir, 'Sessions');
@@ -1662,6 +1680,7 @@ async function buildProfileFromInput(rawData, profiles, settings, existingProfil
         proxySource: proxyFields.proxySource,
         proxyId: proxyFields.proxyId,
         proxyStr: proxyFields.proxyStr,
+        proxyCoreOverride: normalizeProfileProxyCoreOverride(firstDefined(data.proxyCoreOverride, existingProfile?.proxyCoreOverride)),
         tags: normalizeTags(firstDefined(data.tags, existingProfile?.tags, [])),
         notes: normalizeProfileNotes(firstDefined(data.notes, data.note, data.profileNotes, existingProfile?.notes, existingProfile?.note, existingProfile?.profileNotes, '')),
         fingerprint,
@@ -2203,7 +2222,7 @@ async function stopRunningProfile(profileId, options = {}) {
     const proc = activeProcesses[profileId];
     if (!proc) return false;
 
-    await forceKill(proc.xrayPid);
+    await forceKill(proc.proxyCorePid || proc.xrayPid);
     try { await proc.browser.close(); } catch (e) { }
     if (proc.logFd !== undefined) {
         try { fs.closeSync(proc.logFd); } catch (e) { }
@@ -3111,6 +3130,34 @@ function readFileTailSafe(filePath, maxLength = 500) {
     }
 }
 
+function sanitizeLogLabel(value, fallback = '-') {
+    const text = String(value || '').replace(/[\r\n\t]+/g, ' ').trim();
+    return text || fallback;
+}
+
+function writeProxyCoreLaunchSummary(logFd, summary = {}) {
+    if (logFd === undefined || logFd === null) return;
+    const parts = [
+        `[GeekEZ proxy-core] ${new Date().toISOString()}`,
+        `profile="${sanitizeLogLabel(summary.profileName)}"`,
+        `core=${sanitizeLogLabel(summary.coreType)}`,
+        `local_socks=127.0.0.1:${sanitizeLogLabel(summary.localPort)}`,
+        `config=${sanitizeLogLabel(summary.configName)}`,
+        `main="${sanitizeLogLabel(summary.mainLabel)}"`,
+        `chain=${summary.chainEnabled ? 'enabled' : 'disabled'}`
+    ];
+    if (summary.chainEnabled) {
+        parts.push(`pre="${sanitizeLogLabel(summary.preLabel)}"`);
+        parts.push('main_detour=proxy_pre');
+    }
+    if (summary.dnsEnabled !== undefined) {
+        parts.push(`core_dns=${summary.dnsEnabled ? 'enabled' : 'disabled'}`);
+    }
+    try {
+        fs.writeSync(logFd, `${parts.join(' ')}\n`);
+    } catch (e) { }
+}
+
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -3221,22 +3268,23 @@ async function waitForProxyChainReady(socksPort, processRef = null, options = {}
     return { ...slowResult, phase: 'slow' };
 }
 
-function createProxyStartupError(profileName, reason, xrayLogPath, lang = 'cn') {
+function createProxyStartupError(profileName, reason, proxyCoreLogPath, lang = 'cn', coreType = PROXY_CORE_TYPES.XRAY) {
     const displayName = profileName || '当前环境';
+    const coreLabel = getProxyCoreProcessLabel(coreType);
     const summary = lang === 'en'
-        ? `${displayName} proxy failed to start. Please check whether the proxy is available or try restarting the profile.`
-        : `${displayName}代理启动失败，请检查代理是否可用或尝试重启环境。`;
-    const logTail = readFileTailSafe(xrayLogPath, 500).trim();
+        ? `${displayName} ${coreLabel} proxy failed to start. Please check whether the proxy is available or try restarting the profile.`
+        : `${displayName}${coreLabel}代理启动失败，请检查代理是否可用或尝试重启环境。`;
+    const logTail = readFileTailSafe(proxyCoreLogPath, 500).trim();
     const extraReason = String(reason || '').trim();
 
     if (logTail) {
-        console.error(`[Xray Launch Failed] ${displayName}: ${extraReason || 'unknown'}\n${logTail}`);
+        console.error(`[${coreLabel} Launch Failed] ${displayName}: ${extraReason || 'unknown'}\n${logTail}`);
     } else {
-        console.error(`[Xray Launch Failed] ${displayName}: ${extraReason || 'unknown'}`);
+        console.error(`[${coreLabel} Launch Failed] ${displayName}: ${extraReason || 'unknown'}`);
     }
 
     const err = new Error(summary);
-    err.code = 'XRAY_STARTUP_FAILED';
+    err.code = coreType === PROXY_CORE_TYPES.SING_BOX ? 'SING_BOX_STARTUP_FAILED' : 'XRAY_STARTUP_FAILED';
     err.detail = extraReason;
     return err;
 }
@@ -3265,7 +3313,7 @@ async function waitForSocksProxyUsable(socksPort, timeoutMs = 4500, connectTimeo
         if (processRef && processRef.exitCode !== null) {
             return {
                 success: false,
-                msg: `xray exited before proxy became usable (code: ${processRef.exitCode})`,
+                msg: `proxy core exited before proxy became usable (code: ${processRef.exitCode})`,
                 details: lastDetails
             };
         }
@@ -3328,6 +3376,19 @@ async function waitForXrayPortOrSpawnError(processRef, port, timeoutMs) {
         waitForLocalPortReady(port, timeoutMs).then((ready) => ({ ready })),
         spawnErrorPromise.then((spawnError) => ({ ready: false, spawnError }))
     ]);
+}
+
+async function resolveProxyTestRuntimeContext(probeOptions = {}) {
+    const rawSettings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : {};
+    const settings = normalizeSettingsSnapshot(rawSettings);
+    const proxyCoreOverride = probeOptions.proxyCoreOverride || probeOptions.proxyCoreType || probeOptions.coreType;
+    const coreType = resolveProxyCoreType(settings, { proxyCoreOverride });
+    return {
+        coreType,
+        coreLabel: getProxyCoreProcessLabel(coreType),
+        singBoxOptions: settings.proxyCore?.singBox,
+        dnsLeakProtection: settings.dnsLeakProtection
+    };
 }
 
 async function measureSocksConnectLatency(socksPort, timeoutMs = DEFAULT_PROXY_TEST_TIMEOUT_MS, customTargets = null) {
@@ -3431,50 +3492,43 @@ async function measureSocksConnectLatency(socksPort, timeoutMs = DEFAULT_PROXY_T
 
 async function runProxyLatencyTest(proxyStr, probeOptions = {}) {
     const tempPort = await getAvailablePort();
-    const tempConfigPath = path.join(app.getPath('userData'), `test_config_${tempPort}.json`);
-    let xrayProcess = null;
+    let tempConfigPath = null;
+    let proxyCoreProcess = null;
     try {
-        let outbound;
-        try {
-            outbound = parseProxyLink(proxyStr, "proxy_test");
-        } catch (err) {
-            return { success: false, msg: "Format Err" };
-        }
-        const config = {
-            log: { loglevel: "warning" },
-            inbounds: [{
-                port: tempPort,
-                listen: "127.0.0.1",
-                protocol: "socks",
-                settings: {
-                    auth: "noauth",
-                    udp: false
-                }
-            }],
-            outbounds: [outbound, { protocol: "freedom", tag: "direct" }],
-            routing: {
-                domainStrategy: "AsIs",
-                rules: [{ type: "field", outboundTag: "proxy_test", port: "0-65535" }]
-            }
-        };
+        const runtime = await resolveProxyTestRuntimeContext(probeOptions);
+        tempConfigPath = path.join(app.getPath('userData'), `test_${runtime.coreType}_config_${tempPort}.json`);
+        const config = generateProxyCoreConfig({
+            coreType: runtime.coreType,
+            mainProxyStr: proxyStr,
+            localPort: tempPort,
+            preProxyConfig: null,
+            dnsLeakProtection: runtime.dnsLeakProtection,
+            singBoxOptions: runtime.singBoxOptions
+        });
         await fs.writeJson(tempConfigPath, config);
 
-        xrayProcess = spawn(BIN_PATH, ['-c', tempConfigPath], { cwd: BIN_DIR, env: { ...process.env, 'XRAY_LOCATION_ASSET': RESOURCES_BIN }, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
-        xrayProcess.stderr?.on('data', () => { });
-        xrayProcess.stdout?.on('data', () => { });
+        const spawnOptions = getProxyCoreSpawnOptions(runtime.coreType, tempConfigPath, { resourcesBin: RESOURCES_BIN });
+        proxyCoreProcess = spawn(spawnOptions.command, spawnOptions.args, {
+            cwd: spawnOptions.cwd,
+            env: spawnOptions.env,
+            stdio: ['ignore', 'pipe', 'pipe'],
+            windowsHide: true
+        });
+        proxyCoreProcess.stderr?.on('data', () => { });
+        proxyCoreProcess.stdout?.on('data', () => { });
 
         const readyTimeoutMs = clampProxyTestTimeout(probeOptions.readyTimeoutMs, DEFAULT_PROXY_TEST_READY_TIMEOUT_MS, MAX_PROXY_TEST_READY_TIMEOUT_MS);
-        const { ready, spawnError } = await waitForXrayPortOrSpawnError(xrayProcess, tempPort, readyTimeoutMs);
+        const { ready, spawnError } = await waitForXrayPortOrSpawnError(proxyCoreProcess, tempPort, readyTimeoutMs);
         if (spawnError) {
-            xrayProcess = null;
+            proxyCoreProcess = null;
             try { fs.unlinkSync(tempConfigPath); } catch (e) { }
-            return { success: false, msg: sanitizeProxyTestMessage(spawnError.message, 'Xray start failed') };
+            return { success: false, msg: sanitizeProxyTestMessage(spawnError.message, `${runtime.coreLabel} start failed`) };
         }
-        if (!ready || xrayProcess.exitCode !== null) {
-            await forceKill(xrayProcess.pid);
-            xrayProcess = null;
+        if (!ready || proxyCoreProcess.exitCode !== null) {
+            await forceKill(proxyCoreProcess.pid);
+            proxyCoreProcess = null;
             try { fs.unlinkSync(tempConfigPath); } catch (e) { }
-            return { success: false, msg: 'Xray not ready' };
+            return { success: false, msg: `${runtime.coreLabel} not ready` };
         }
 
         const probeTimeoutMs = clampProxyTestTimeout(probeOptions.timeoutMs, DEFAULT_PROXY_TEST_TIMEOUT_MS, MAX_PROXY_TEST_TIMEOUT_MS);
@@ -3483,14 +3537,14 @@ async function runProxyLatencyTest(proxyStr, probeOptions = {}) {
             probeTimeoutMs,
             normalizeProxyProbeTargets(probeOptions)
         );
-        await forceKill(xrayProcess.pid);
-        xrayProcess = null;
+        await forceKill(proxyCoreProcess.pid);
+        proxyCoreProcess = null;
         try { fs.unlinkSync(tempConfigPath); } catch (e) { }
         return result;
     } catch (err) {
-        if (xrayProcess) try { await forceKill(xrayProcess.pid); } catch (e) { }
-        try { fs.unlinkSync(tempConfigPath); } catch (e) { }
-        return { success: false, msg: sanitizeProxyTestMessage(err?.message) };
+        if (proxyCoreProcess) try { await forceKill(proxyCoreProcess.pid); } catch (e) { }
+        if (tempConfigPath) try { fs.unlinkSync(tempConfigPath); } catch (e) { }
+        return { success: false, msg: sanitizeProxyTestMessage(err?.message, 'Format Err') };
     }
 }
 
@@ -3501,32 +3555,43 @@ async function runProxyChainLatencyTest(payload = {}, probeOptions = {}) {
     if (!preProxyUrl) return { success: false, msg: 'Pre-proxy required' };
 
     const tempPort = await getAvailablePort();
-    const tempConfigPath = path.join(app.getPath('userData'), `test_chain_config_${tempPort}.json`);
-    let xrayProcess = null;
+    let tempConfigPath = null;
+    let proxyCoreProcess = null;
     try {
-        const config = generateXrayConfig(
-            outboundUrl,
-            tempPort,
-            { preProxies: [{ id: 'chain-test-pre', url: preProxyUrl }] }
-        );
+        const runtime = await resolveProxyTestRuntimeContext(probeOptions);
+        tempConfigPath = path.join(app.getPath('userData'), `test_chain_${runtime.coreType}_config_${tempPort}.json`);
+        const config = generateProxyCoreConfig({
+            coreType: runtime.coreType,
+            mainProxyStr: outboundUrl,
+            localPort: tempPort,
+            preProxyConfig: { preProxies: [{ id: 'chain-test-pre', url: preProxyUrl }] },
+            dnsLeakProtection: runtime.dnsLeakProtection,
+            singBoxOptions: runtime.singBoxOptions
+        });
         await fs.writeJson(tempConfigPath, config);
 
-        xrayProcess = spawn(BIN_PATH, ['-c', tempConfigPath], { cwd: BIN_DIR, env: { ...process.env, 'XRAY_LOCATION_ASSET': RESOURCES_BIN }, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
-        xrayProcess.stderr?.on('data', () => { });
-        xrayProcess.stdout?.on('data', () => { });
+        const spawnOptions = getProxyCoreSpawnOptions(runtime.coreType, tempConfigPath, { resourcesBin: RESOURCES_BIN });
+        proxyCoreProcess = spawn(spawnOptions.command, spawnOptions.args, {
+            cwd: spawnOptions.cwd,
+            env: spawnOptions.env,
+            stdio: ['ignore', 'pipe', 'pipe'],
+            windowsHide: true
+        });
+        proxyCoreProcess.stderr?.on('data', () => { });
+        proxyCoreProcess.stdout?.on('data', () => { });
 
         const readyTimeoutMs = clampProxyTestTimeout(probeOptions.readyTimeoutMs, DEFAULT_PROXY_TEST_READY_TIMEOUT_MS, MAX_PROXY_TEST_READY_TIMEOUT_MS);
-        const { ready, spawnError } = await waitForXrayPortOrSpawnError(xrayProcess, tempPort, readyTimeoutMs);
+        const { ready, spawnError } = await waitForXrayPortOrSpawnError(proxyCoreProcess, tempPort, readyTimeoutMs);
         if (spawnError) {
-            xrayProcess = null;
+            proxyCoreProcess = null;
             try { fs.unlinkSync(tempConfigPath); } catch (e) { }
-            return { success: false, msg: sanitizeProxyTestMessage(spawnError.message, 'Xray start failed') };
+            return { success: false, msg: sanitizeProxyTestMessage(spawnError.message, `${runtime.coreLabel} start failed`) };
         }
-        if (!ready || xrayProcess.exitCode !== null) {
-            await forceKill(xrayProcess.pid);
-            xrayProcess = null;
+        if (!ready || proxyCoreProcess.exitCode !== null) {
+            await forceKill(proxyCoreProcess.pid);
+            proxyCoreProcess = null;
             try { fs.unlinkSync(tempConfigPath); } catch (e) { }
-            return { success: false, msg: 'Xray not ready' };
+            return { success: false, msg: `${runtime.coreLabel} not ready` };
         }
 
         const probeTimeoutMs = clampProxyTestTimeout(probeOptions.timeoutMs, DEFAULT_PROXY_TEST_TIMEOUT_MS, MAX_PROXY_TEST_TIMEOUT_MS);
@@ -3535,14 +3600,14 @@ async function runProxyChainLatencyTest(payload = {}, probeOptions = {}) {
             probeTimeoutMs,
             normalizeProxyProbeTargets(probeOptions)
         );
-        await forceKill(xrayProcess.pid);
-        xrayProcess = null;
+        await forceKill(proxyCoreProcess.pid);
+        proxyCoreProcess = null;
         try { fs.unlinkSync(tempConfigPath); } catch (e) { }
         return result;
     } catch (err) {
-        if (xrayProcess) try { await forceKill(xrayProcess.pid); } catch (e) { }
-        try { fs.unlinkSync(tempConfigPath); } catch (e) { }
-        return { success: false, msg: sanitizeProxyTestMessage(err?.message) };
+        if (proxyCoreProcess) try { await forceKill(proxyCoreProcess.pid); } catch (e) { }
+        if (tempConfigPath) try { fs.unlinkSync(tempConfigPath); } catch (e) { }
+        return { success: false, msg: sanitizeProxyTestMessage(err?.message, 'Format Err') };
     }
 }
 
@@ -4683,11 +4748,11 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
                 }
                 return "环境已唤醒";
             } catch (e) {
-                await forceKill(proc.xrayPid);
+                await forceKill(proc.proxyCorePid || proc.xrayPid);
                 delete activeProcesses[profileId];
             }
         } else {
-            await forceKill(proc.xrayPid);
+            await forceKill(proc.proxyCorePid || proc.xrayPid);
             delete activeProcesses[profileId];
         }
         if (activeProcesses[profileId]) return "环境已唤醒";
@@ -4698,7 +4763,8 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
     }
 
     await markLaunching(true);
-    let xrayProcess = null;
+    let proxyCoreProcess = null;
+    let proxyCoreType = PROXY_CORE_TYPES.XRAY;
     let logFd;
     let browser = null;
     try {
@@ -4803,9 +4869,11 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
             await fs.writeJson(preferencesPath, preferences);
         } catch (e) { }
 
-        const shouldLaunchXray = (!useDirectNetwork) || !!activePreProxy;
-        let xrayLogPath = null;
-        if (shouldLaunchXray) {
+        const shouldLaunchProxyCore = (!useDirectNetwork) || !!activePreProxy;
+        let proxyCoreLogPath = null;
+        if (shouldLaunchProxyCore) {
+            proxyCoreType = resolveProxyCoreType(settings, profile);
+            const proxyCoreLabel = getProxyCoreProcessLabel(proxyCoreType);
             updateLaunchProgress(
                 32,
                 activePreProxy
@@ -4815,16 +4883,40 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
                 { step: 4, profileName: progressProfileName }
             );
             localPort = await getAvailablePort();
-            const xrayConfigPath = path.join(profileDir, 'config.json');
-            xrayLogPath = path.join(profileDir, 'xray_run.log');
+            const proxyCoreConfigPath = path.join(profileDir, getProxyCoreConfigName(proxyCoreType));
+            proxyCoreLogPath = path.join(profileDir, getProxyCoreLogName(proxyCoreType));
             const upstreamProxy = useDirectNetwork ? activePreProxy?.url : resolvedProfileProxy.proxyStr;
             const chainedPreProxy = useDirectNetwork ? null : finalPreProxyConfig;
-            const config = generateXrayConfig(upstreamProxy, localPort, chainedPreProxy, profile.fingerprint, settings.dnsLeakProtection);
-            fs.writeJsonSync(xrayConfigPath, config);
-            logFd = fs.openSync(xrayLogPath, 'a');
-            const xrayLaunchStartedAt = Date.now();
-            xrayProcess = spawn(BIN_PATH, ['-c', xrayConfigPath], { cwd: BIN_DIR, env: { ...process.env, 'XRAY_LOCATION_ASSET': RESOURCES_BIN }, stdio: ['ignore', logFd, logFd], windowsHide: true });
-            const xraySpawnErrorPromise = watchXrayProcess(xrayProcess);
+            const config = generateProxyCoreConfig({
+                coreType: proxyCoreType,
+                mainProxyStr: upstreamProxy,
+                localPort,
+                preProxyConfig: chainedPreProxy,
+                profileFingerprint: profile.fingerprint,
+                dnsLeakProtection: settings.dnsLeakProtection,
+                singBoxOptions: settings.proxyCore?.singBox
+            });
+            fs.writeJsonSync(proxyCoreConfigPath, config);
+            logFd = fs.openSync(proxyCoreLogPath, 'a');
+            writeProxyCoreLaunchSummary(logFd, {
+                profileName: profile.name,
+                coreType: proxyCoreType,
+                localPort,
+                configName: path.basename(proxyCoreConfigPath),
+                mainLabel: useDirectNetwork ? activePreProxy?.remark || activePreProxy?.name || 'Pre Proxy' : resolvedProfileProxy.label,
+                chainEnabled: !!chainedPreProxy?.preProxies?.length,
+                preLabel: activePreProxy?.remark || activePreProxy?.name || activePreProxy?.id,
+                dnsEnabled: !!config.dns
+            });
+            const proxyCoreLaunchStartedAt = Date.now();
+            const spawnOptions = getProxyCoreSpawnOptions(proxyCoreType, proxyCoreConfigPath, { resourcesBin: RESOURCES_BIN });
+            proxyCoreProcess = spawn(spawnOptions.command, spawnOptions.args, {
+                cwd: spawnOptions.cwd,
+                env: spawnOptions.env,
+                stdio: ['ignore', logFd, logFd],
+                windowsHide: true
+            });
+            const proxyCoreSpawnErrorPromise = watchXrayProcess(proxyCoreProcess);
             updateLaunchProgress(
                 40,
                 preferredLang === 'en' ? 'Waiting for local proxy port...' : '正在等待本地代理端口就绪...',
@@ -4834,17 +4926,17 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
             const readyTimeoutMs = proxyStartupHealthCheck.readyTimeoutMs;
             const { ready, spawnError } = await Promise.race([
                 waitForLocalPortReady(localPort, readyTimeoutMs).then((isReady) => ({ ready: isReady })),
-                xraySpawnErrorPromise.then((err) => ({ ready: false, spawnError: err }))
+                proxyCoreSpawnErrorPromise.then((err) => ({ ready: false, spawnError: err }))
             ]);
             if (spawnError) {
-                throw createProxyStartupError(profile.name, 'xray failed to start', xrayLogPath, uiLang);
+                throw createProxyStartupError(profile.name, `${proxyCoreLabel} failed to start`, proxyCoreLogPath, uiLang, proxyCoreType);
             }
             if (!ready) {
-                const exitCode = xrayProcess.exitCode;
+                const exitCode = proxyCoreProcess.exitCode;
                 const reason = exitCode !== null
-                    ? `xray exited before ready (code: ${exitCode})`
-                    : `xray socks port ${localPort} not ready within ${readyTimeoutMs}ms`;
-                throw createProxyStartupError(profile.name, reason, xrayLogPath, uiLang);
+                    ? `${proxyCoreLabel} exited before ready (code: ${exitCode})`
+                    : `${proxyCoreLabel} socks port ${localPort} not ready within ${readyTimeoutMs}ms`;
+                throw createProxyStartupError(profile.name, reason, proxyCoreLogPath, uiLang, proxyCoreType);
             }
 
             // Xray may bind the local SOCKS port before the upstream proxy chain is fully usable.
@@ -4853,7 +4945,7 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
                 ? proxyStartupHealthCheck.preProxy
                 : proxyStartupHealthCheck.direct;
             const minWarmupMs = startupHealthPhase.warmupMs;
-            const remainingWarmupMs = minWarmupMs - (Date.now() - xrayLaunchStartedAt);
+            const remainingWarmupMs = minWarmupMs - (Date.now() - proxyCoreLaunchStartedAt);
             if (remainingWarmupMs > 0) {
                 await new Promise((resolve) => setTimeout(resolve, remainingWarmupMs));
             }
@@ -4868,7 +4960,7 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
             );
             const proxyUsable = await waitForProxyChainReady(
                 localPort,
-                xrayProcess,
+                proxyCoreProcess,
                 {
                     fastReadyTimeoutMs: startupHealthPhase.fastReadyTimeoutMs,
                     fastProbeTimeoutMs: startupHealthPhase.fastProbeTimeoutMs,
@@ -4882,8 +4974,9 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
                 throw createProxyStartupError(
                     profile.name,
                     probeSummary || proxyUsable.msg || 'proxy chain not usable after startup',
-                    xrayLogPath,
-                    uiLang
+                    proxyCoreLogPath,
+                    uiLang,
+                    proxyCoreType
                 );
             }
         } else {
@@ -5050,8 +5143,8 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
         // 5. 启动浏览器
         const chromePath = getChromiumPath();
         if (!chromePath) {
-            if (xrayProcess && xrayProcess.pid) {
-                await forceKill(xrayProcess.pid);
+            if (proxyCoreProcess && proxyCoreProcess.pid) {
+                await forceKill(proxyCoreProcess.pid);
             }
             throw new Error("Chrome binary not found.");
         }
@@ -5492,7 +5585,10 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
         }
 
         activeProcesses[profileId] = {
-            xrayPid: xrayProcess ? xrayProcess.pid : null,
+            proxyCoreType,
+            proxyCorePid: proxyCoreProcess ? proxyCoreProcess.pid : null,
+            xrayPid: proxyCoreProcess && proxyCoreType === PROXY_CORE_TYPES.XRAY ? proxyCoreProcess.pid : null,
+            localPort,
             browser,
             logFd: logFd  // 存储日志文件描述符，用于后续关闭
         };
@@ -5570,7 +5666,7 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
 
         browser.on('disconnected', async () => {
             if (activeProcesses[profileId]) {
-                const pid = activeProcesses[profileId].xrayPid;
+                const pid = activeProcesses[profileId].proxyCorePid || activeProcesses[profileId].xrayPid;
                 const logFd = activeProcesses[profileId].logFd;
 
                 // 关闭日志文件描述符
@@ -5604,8 +5700,8 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
             if (browser) await browser.close();
         } catch (e) { }
 
-        if (xrayProcess && xrayProcess.pid) {
-            await forceKill(xrayProcess.pid);
+        if (proxyCoreProcess && proxyCoreProcess.pid) {
+            await forceKill(proxyCoreProcess.pid);
         }
 
         if (logFd !== undefined) {
@@ -5634,7 +5730,7 @@ app.on('before-quit', () => {
 
 app.on('window-all-closed', () => {
     if (!isAppQuitting) return;
-    Object.values(activeProcesses).forEach(p => forceKill(p.xrayPid));
+    Object.values(activeProcesses).forEach(p => forceKill(p.proxyCorePid || p.xrayPid));
     if (appTray && (typeof appTray.isDestroyed !== 'function' || !appTray.isDestroyed())) {
         try { appTray.destroy(); } catch (e) { }
         appTray = null;
