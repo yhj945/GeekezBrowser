@@ -18,6 +18,20 @@ const DEFAULT_DNS_LEAK_PROTECTION = {
     dohServers: ['https://1.1.1.1/dns-query', 'https://8.8.8.8/dns-query']
 };
 
+const DEFAULT_PROXY_CORE = {
+    type: 'xray',
+    singBox: {
+        dnsEnabled: true,
+        dnsStrategy: 'ipv4_only',
+        finalDnsTag: 'remote-dns',
+        remoteDnsServers: ['https://1.1.1.1/dns-query', 'https://8.8.8.8/dns-query'],
+        enableDnsThroughProxy: true,
+        strictRoute: true,
+        disableCache: false,
+        independentCache: true
+    }
+};
+
 function cloneProxyStartupHealthCheck(value = EMPTY_PROXY_STARTUP_HEALTH_CHECK) {
     return JSON.parse(JSON.stringify(value || EMPTY_PROXY_STARTUP_HEALTH_CHECK));
 }
@@ -29,6 +43,30 @@ function cloneDnsLeakProtection(value = DEFAULT_DNS_LEAK_PROTECTION) {
         ...JSON.parse(JSON.stringify(source)),
         xrayDnsEnabled: xrayDnsExplicit && source.xrayDnsEnabled === true,
         xrayDnsExplicit
+    };
+}
+
+function cloneProxyCore(value = DEFAULT_PROXY_CORE) {
+    const source = value && typeof value === 'object' ? value : DEFAULT_PROXY_CORE;
+    const singBox = source.singBox && typeof source.singBox === 'object' ? source.singBox : {};
+    const dnsStrategy = ['ipv4_only', 'prefer_ipv4', 'prefer_ipv6', 'ipv6_only', 'as_is'].includes(singBox.dnsStrategy || singBox.strategy)
+        ? (singBox.dnsStrategy || singBox.strategy)
+        : DEFAULT_PROXY_CORE.singBox.dnsStrategy;
+    const remoteDnsServers = Array.isArray(singBox.remoteDnsServers)
+        ? singBox.remoteDnsServers.map(v => String(v || '').trim()).filter(Boolean)
+        : String(singBox.remoteDnsServers || singBox.servers || '').split(/[\r\n,]+/).map(v => v.trim()).filter(Boolean);
+    return {
+        type: source.type === 'sing-box' ? 'sing-box' : 'xray',
+        singBox: {
+            dnsEnabled: singBox.dnsEnabled !== false && singBox.enabled !== false,
+            dnsStrategy,
+            finalDnsTag: String(singBox.finalDnsTag || DEFAULT_PROXY_CORE.singBox.finalDnsTag),
+            remoteDnsServers,
+            enableDnsThroughProxy: singBox.enableDnsThroughProxy !== false,
+            strictRoute: singBox.strictRoute !== false,
+            disableCache: singBox.disableCache === true,
+            independentCache: singBox.independentCache !== false
+        }
     };
 }
 
@@ -48,6 +86,7 @@ export const useSettingsStore = defineStore('settings', {
         isDefaultDataPath: true,
         proxyStartupHealthCheck: cloneProxyStartupHealthCheck(),
         dnsLeakProtection: cloneDnsLeakProtection(),
+        proxyCore: cloneProxyCore(),
         activeTab: 'extensions'
     }),
 
@@ -67,6 +106,7 @@ export const useSettingsStore = defineStore('settings', {
                 this.apiPort = settings.apiPort || 12138;
                 this.proxyStartupHealthCheck = cloneProxyStartupHealthCheck(settings.proxyStartupHealthCheck);
                 this.dnsLeakProtection = cloneDnsLeakProtection(settings.dnsLeakProtection);
+                this.proxyCore = cloneProxyCore(settings.proxyCore);
                 this.watermarkStyle = settings.watermarkStyle || 'enhanced';
                 localStorage.setItem('geekez_watermark_style', this.watermarkStyle);
 
@@ -184,6 +224,13 @@ export const useSettingsStore = defineStore('settings', {
         async saveDnsLeakProtection(config) {
             const settings = await ipcService.getSettings();
             settings.dnsLeakProtection = cloneDnsLeakProtection(config);
+            await ipcService.saveSettings(settings);
+            await this.loadSettings();
+        },
+
+        async saveProxyCore(config) {
+            const settings = await ipcService.getSettings();
+            settings.proxyCore = cloneProxyCore(config);
             await ipcService.saveSettings(settings);
             await this.loadSettings();
         },

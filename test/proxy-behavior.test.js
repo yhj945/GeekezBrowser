@@ -22,6 +22,22 @@ const {
   DEFAULT_PROXY_STARTUP_HEALTH_CONFIG,
   normalizeProxyStartupHealthConfig
 } = require('../src/main/proxy-startup-health-config');
+const {
+  normalizeProxyCoreConfig,
+  normalizeSingBoxOptions,
+  resolveProxyCoreType
+} = require('../src/main/proxy-core/proxy-core-config');
+const {
+  resolveSingBoxAssetDir,
+  resolveSingBoxBinary,
+  getSingBoxExecutableName
+} = require('../src/main/proxy-core/sing-box-assets');
+const {
+  generateSingBoxConfig
+} = require('../src/main/proxy-core/sing-box-config');
+const {
+  getProxyCoreConfigName
+} = require('../src/main/proxy-core/proxy-core-runtime');
 const { filterManagedLaunchArgs, parseCustomLaunchArgs } = require('../src/main/launch-args');
 const { resolveChromiumPath } = require('../src/main/chromium-path');
 const {
@@ -47,8 +63,7 @@ let buildCanvasFingerprintPreview;
 
 function loadMainUtilsForTest() {
   const utilsPath = path.join(__dirname, '..', 'src', 'main', 'utils.js');
-  const source = fs.readFileSync(utilsPath, 'utf8')
-    .replace(/export \{ generateXrayConfig, parseProxyLink, getProxyRemark \};\s*$/, 'module.exports = { generateXrayConfig, parseProxyLink, getProxyRemark };');
+  const source = fs.readFileSync(utilsPath, 'utf8');
   const localRequire = (moduleName) => {
     if (moduleName === './dns-leak-protection') {
       return require('../src/main/dns-leak-protection');
@@ -126,6 +141,7 @@ function testDuplicateProfilePayload() {
     name: 'Shop US',
     proxySource: 'managed',
     proxyId: 'out-1',
+    proxyCoreOverride: 'sing-box',
     proxyStr: '',
     tags: ['shop', 'us'],
     preProxyOverride: 'on',
@@ -159,6 +175,7 @@ function testDuplicateProfilePayload() {
   assert.strictEqual(copy.proxySource, 'managed');
   assert.strictEqual(copy.proxyId, 'out-1');
   assert.strictEqual(copy.proxyStr, '');
+  assert.strictEqual(copy.proxyCoreOverride, source.proxyCoreOverride);
   assert.strictEqual(copy.preProxyOverride, 'on');
   assert.strictEqual(copy.preProxyId, 'pre-1');
   assert.strictEqual(copy.isSetup, false);
@@ -168,6 +185,11 @@ function testDuplicateProfilePayload() {
   assert.strictEqual(copy.runtimeState, undefined);
   assert.strictEqual(source.name, 'Shop US');
   assert.strictEqual(source.isSetup, true);
+}
+
+function testProxyCoreConfigNamesAreDistinct() {
+  assert.strictEqual(getProxyCoreConfigName('xray'), 'xray.config.json');
+  assert.strictEqual(getProxyCoreConfigName('sing-box'), 'sing-box.config.json');
 }
 
 function testOutboundProxyFields() {
@@ -526,6 +548,139 @@ function testProfileProxyResolution() {
       { outboundProxies: [{ id: 'disabled-node', remark: 'Disabled Node', url: 'vless://disabled@example.com:443?security=tls&type=tcp', enable: false }] }
     ),
     /出口代理节点不可用/
+  );
+}
+
+function testProxyCoreConfigDefaultsAndOverrides() {
+  assert.deepStrictEqual(normalizeProxyCoreConfig({}), {
+    type: 'xray',
+    singBox: {
+      enabled: true,
+      dnsEnabled: true,
+      strategy: 'ipv4_only',
+      dnsStrategy: 'ipv4_only',
+      finalDnsTag: 'remote-dns',
+      remoteDnsServers: ['https://1.1.1.1/dns-query', 'https://8.8.8.8/dns-query'],
+      enableDnsThroughProxy: true,
+      strictRoute: true,
+      disableCache: false,
+      independentCache: true
+    }
+  });
+
+  assert.strictEqual(normalizeProxyCoreConfig({ type: 'singbox' }).type, 'sing-box');
+  assert.strictEqual(normalizeProxyCoreConfig({ type: 'invalid' }).type, 'xray');
+  assert.strictEqual(resolveProxyCoreType({ proxyCore: { type: 'sing-box' } }, {}), 'sing-box');
+  assert.strictEqual(resolveProxyCoreType({ proxyCore: { type: 'sing-box' } }, { proxyCoreOverride: 'xray' }), 'xray');
+  assert.strictEqual(resolveProxyCoreType({ proxyCore: { type: 'xray' } }, { proxyCoreOverride: 'sing-box' }), 'sing-box');
+
+  const singBox = normalizeSingBoxOptions({
+    dnsStrategy: 'prefer-ipv4',
+    remoteDnsServers: 'https://dns.example/dns-query\nhttps://dns.example/dns-query\nudp://1.1.1.1',
+    enableDnsThroughProxy: false,
+    independentCache: false,
+    disableCache: true
+  });
+  assert.strictEqual(singBox.dnsStrategy, 'prefer_ipv4');
+  assert.deepStrictEqual(singBox.remoteDnsServers, ['https://dns.example/dns-query', 'udp://1.1.1.1']);
+  assert.strictEqual(singBox.enableDnsThroughProxy, false);
+  assert.strictEqual(singBox.independentCache, false);
+  assert.strictEqual(singBox.disableCache, true);
+}
+
+function testSingBoxAssetResolution() {
+  const root = path.join('/tmp', 'geekez-bin');
+  assert.strictEqual(getSingBoxExecutableName('win32'), 'sing-box.exe');
+  assert.strictEqual(getSingBoxExecutableName('linux'), 'sing-box');
+  assert.strictEqual(resolveSingBoxAssetDir({ resourcesBin: root, platform: 'linux', arch: 'x64' }), path.join(root, 'sing-box', 'linux-x64'));
+  assert.strictEqual(resolveSingBoxAssetDir({ resourcesBin: root, platform: 'darwin', arch: 'arm64' }), path.join(root, 'sing-box', 'darwin-arm64'));
+  assert.strictEqual(resolveSingBoxAssetDir({ resourcesBin: root, platform: 'freebsd', arch: 'x64' }), null);
+  assert.deepStrictEqual(resolveSingBoxBinary({ resourcesBin: root, platform: 'win32', arch: 'arm64' }), {
+    binDir: path.join(root, 'sing-box', 'win32-arm64'),
+    binPath: path.join(root, 'sing-box', 'win32-arm64', 'sing-box.exe')
+  });
+}
+
+function testGenerateSingBoxConfigMapsProtocolsAndDns() {
+  const vless = generateSingBoxConfig(
+    'vless://main-user@main.example.com:443?security=reality&type=tcp&sni=main.example.com&pbk=public-key&sid=abcd',
+    25001,
+    null,
+    { uaMode: 'spoof', browserType: 'edge', browserMajorVersion: 149 },
+    { dnsEnabled: true, remoteDnsServers: ['https://dns.example/dns-query'], enableDnsThroughProxy: true }
+  );
+  assert.strictEqual(vless.inbounds[0].type, 'socks');
+  assert.strictEqual(vless.inbounds[0].listen_port, 25001);
+  assert.strictEqual(vless.outbounds[0].type, 'vless');
+  assert.strictEqual(vless.outbounds[0].uuid, 'main-user');
+  assert.strictEqual(vless.outbounds[0].tls.reality.enabled, true);
+  assert.strictEqual(vless.outbounds[0].tls.utls.fingerprint, 'edge');
+  const bootstrapDns = vless.dns.servers.find(server => server.tag === 'bootstrap-dns');
+  const remoteDns = vless.dns.servers.find(server => server.tag === 'remote-dns');
+  assert.strictEqual(bootstrapDns.type, 'local');
+  assert.strictEqual(remoteDns.type, 'https');
+  assert.strictEqual(remoteDns.server, 'dns.example');
+  assert.strictEqual(remoteDns.path, '/dns-query');
+  assert.strictEqual(remoteDns.detour, 'proxy_main');
+  assert.strictEqual(vless.dns.final, 'remote-dns');
+  assert.strictEqual(vless.dns.reverse_mapping, true);
+  assert.strictEqual(vless.route.final, 'proxy_main');
+  assert.strictEqual(vless.route.default_domain_resolver, 'bootstrap-dns');
+  assert.deepStrictEqual(vless.route.rules, [{
+    inbound: 'local-socks',
+    action: 'resolve',
+    strategy: 'ipv4_only'
+  }]);
+
+  const trojan = generateSingBoxConfig(
+    'trojan://secret@trojan.example.com:443?security=tls&type=ws&sni=trojan.example.com&path=%2Fws&host=front.example.com',
+    25002,
+    null,
+    {},
+    { dnsEnabled: false }
+  );
+  assert.strictEqual(trojan.outbounds[0].type, 'trojan');
+  assert.strictEqual(trojan.outbounds[0].password, 'secret');
+  assert.strictEqual(trojan.outbounds[0].transport.type, 'ws');
+  assert.strictEqual(trojan.dns, undefined);
+  assert.strictEqual(trojan.route.rules, undefined);
+
+  const ss = generateSingBoxConfig('ss://YWVzLTEyOC1nY206cGFzcw@example.com:8388', 25003);
+  assert.strictEqual(ss.outbounds[0].type, 'shadowsocks');
+  assert.strictEqual(ss.outbounds[0].method, 'aes-128-gcm');
+
+  const httpProxy = generateSingBoxConfig('http://user:pass@http.example.com:8080', 25004);
+  assert.strictEqual(httpProxy.outbounds[0].type, 'http');
+  assert.strictEqual(httpProxy.outbounds[0].username, 'user');
+  assert.strictEqual(httpProxy.dns.servers.find(server => server.tag === 'remote-dns').server, '1.1.1.1');
+  assert.strictEqual(httpProxy.dns.servers.find(server => server.tag === 'remote-dns-2').server, '8.8.8.8');
+  assert.strictEqual(httpProxy.dns.servers.find(server => server.tag === 'remote-dns').detour, 'proxy_main');
+}
+
+function testGenerateSingBoxConfigAddsPreProxyDetour() {
+  const config = generateSingBoxConfig(
+    'vless://main-user@main.example.com:443?security=tls&type=tcp&sni=main.example.com',
+    25005,
+    { preProxies: [{ id: 'pre', url: 'socks://pre-user:pre-pass@pre.example.com:1080' }] },
+    { uaMode: 'none' }
+  );
+  const pre = config.outbounds.find(outbound => outbound.tag === 'proxy_pre');
+  const main = config.outbounds.find(outbound => outbound.tag === 'proxy_main');
+  assert.strictEqual(pre.type, 'socks');
+  assert.strictEqual(pre.username, 'pre-user');
+  assert.strictEqual(main.detour, 'proxy_pre');
+}
+
+function testGenerateSingBoxConfigRejectsUnsupportedTransportSafely() {
+  const rawProxy = 'vless://11111111-1111-1111-1111-111111111111@main.example.com:443?security=tls&type=xhttp&sni=main.example.com&pbk=secret-public-key';
+  assert.throws(
+    () => generateSingBoxConfig(rawProxy, 25006),
+    (err) => {
+      assert.strictEqual(err.code, 'SING_BOX_CONFIG_UNSUPPORTED');
+      assert.strictEqual(String(err.message).includes(rawProxy), false);
+      assert.strictEqual(String(err.message).includes('11111111-1111-1111-1111-111111111111'), false);
+      return /transport 'xhttp'/.test(err.message);
+    }
   );
 }
 
@@ -1119,6 +1274,7 @@ function main() {
   } = loadFingerprintForTest());
 
   testDuplicateProfilePayload();
+  testProxyCoreConfigNamesAreDistinct();
   testOutboundProxyFields();
   testProxyProbeTargets();
   testProxyStartupHealthConfig();
@@ -1126,6 +1282,11 @@ function main() {
   testProfilePreProxyRejectsEmptyGlobalNode();
   testProfilePreProxyRejectsEnabledModeWithoutActiveNodes();
   testProfileProxyResolution();
+  testProxyCoreConfigDefaultsAndOverrides();
+  testSingBoxAssetResolution();
+  testGenerateSingBoxConfigMapsProtocolsAndDns();
+  testGenerateSingBoxConfigAddsPreProxyDetour();
+  testGenerateSingBoxConfigRejectsUnsupportedTransportSafely();
   testMainProxyKeepsExplicitFingerprint();
   testChainedXrayConfigKeepsPreProxyFingerprint();
   testChainedXrayConfigAddsMissingPreProxyFingerprint();

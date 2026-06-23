@@ -60,6 +60,13 @@
         <div v-if="form.proxySource === 'global'" class="hint-text">{{ $t('globalProxyHint') }}</div>
         <div v-if="form.proxySource === 'direct'" class="hint-text">{{ $t('directProxyHint') }}</div>
 
+        <label class="label-tiny">{{ $t('profileProxyCoreLabel') }}</label>
+        <select v-model="form.proxyCoreOverride">
+          <option value="inherit">{{ $t('profileProxyCoreInherit') }}</option>
+          <option value="xray">{{ $t('profileProxyCoreXray') }}</option>
+          <option value="sing-box">{{ $t('profileProxyCoreSingBox') }}</option>
+        </select>
+
         <div class="flex-row">
           <div class="flex-1">
             <label class="label-tiny">{{ $t('preProxySetting') }}</label>
@@ -165,6 +172,7 @@ const form = reactive({
   proxyId: '',
   notes: '',
   proxyStr: '',
+  proxyCoreOverride: 'inherit',
   timezone: 'Auto',
   city: null,
   language: 'auto',
@@ -301,6 +309,7 @@ watch(() => uiStore.addModalVisible, async (newVal) => {
       proxyId: '',
       notes: '',
       proxyStr: '',
+      proxyCoreOverride: 'inherit',
       timezone: 'Auto',
       city: null,
       language: 'auto',
@@ -375,6 +384,7 @@ async function handleSave() {
         proxySource: form.proxySource,
         proxyId: form.proxySource === 'managed' ? form.proxyId : null,
         proxyStr: form.proxySource === 'custom' ? proxyStr : (form.proxySource === 'direct' ? 'direct' : ''),
+        proxyCoreOverride: ['xray', 'sing-box'].includes(form.proxyCoreOverride) ? form.proxyCoreOverride : 'inherit',
         tags,
         notes: form.notes,
         timezone: form.timezone,

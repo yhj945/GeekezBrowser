@@ -493,4 +493,10 @@ function generateXrayConfig(mainProxyStr, localPort, preProxyConfig = null, prof
     return config;
 }
 
-export { generateXrayConfig, parseProxyLink, getProxyRemark };
+module.exports = {
+    generateXrayConfig,
+    parseProxyLink,
+    getProxyRemark,
+    deriveUtlsFingerprint,
+    applyUtlsFingerprint
+};

@@ -1,6 +1,6 @@
 {
   "name": "geekez-browser",
-  "version": "1.5.4",
+  "version": "1.5.5",
   "description": "Stealthy Anti-Detect Browser for E-Commerce",
   "main": "out/main/index.js",
   "author": "EchoHS",
@@ -16,7 +16,8 @@
   "build": {
     "appId": "com.geekez.browser",
     "productName": "GeekEZ Browser",
-    "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
+    "artifactName": "GeekEZ-Browser-${version}-${os}-${arch}.${ext}",
+    "afterPack": "build/after-pack-prune-sing-box.js",
     "directories": {
       "output": "dist"
     },
@@ -63,7 +64,7 @@
         }
       ],
       "icon": "resources/logo.ico",
-      "artifactName": "${productName}-${version}-${os}-${arch}.${ext}"
+      "artifactName": "GeekEZ-Browser-${version}-${os}-${arch}.${ext}"
     },
     "nsis": {
       "oneClick": false,
