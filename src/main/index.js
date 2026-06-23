@@ -69,8 +69,7 @@ async function createSocksProxyAgent(proxyUrl) {
 // Only disable if GPU compatibility issues occur
 
 import { generateXrayConfig, parseProxyLink, getProxyRemark } from './utils';
-import { generateFingerprint, getInjectScript, getWorkerInjectScript, getWatermarkScript, ensureProfileScopedNoiseSeed, rotateProfileNoiseSeed, buildCanvasFingerprintPreview } from './fingerprint';
-
+import { generateFingerprint, getInjectScript, getGeolocationScript, getWorkerInjectScript, getWatermarkScript, ensureProfileScopedNoiseSeed, rotateProfileNoiseSeed, buildCanvasFingerprintPreview } from './fingerprint';
 const isDev = !app.isPackaged;
 const RESOURCES_BIN = isDev ? path.join(app.getAppPath(), 'resources', 'bin') : path.join(process.resourcesPath, 'bin');
 // Use platform+arch specific directory for xray binary
@@ -526,6 +525,11 @@ function normalizeTags(rawTags) {
             .filter(Boolean);
     }
     return [];
+}
+
+function normalizeProfileNotes(rawNotes) {
+    if (rawNotes === undefined || rawNotes === null) return '';
+    return String(rawNotes).replace(/\r\n/g, '\n');
 }
 
 function sanitizeExtensionStoreId(rawId) {
@@ -1154,6 +1158,217 @@ function normalizeSettingsSnapshot(settings) {
     return nextSettings;
 }
 
+function isAutoTimezoneValue(value) {
+    const normalized = String(value || '').trim().toLowerCase();
+    return !normalized ||
+        normalized === 'auto' ||
+        normalized === 'auto (ip based)' ||
+        normalized === 'auto (ip base)' ||
+        normalized === 'auto (no change)';
+}
+
+function isAutoIpBasedCityValue(value) {
+    const normalized = String(value || '').trim().toLowerCase();
+    return !normalized ||
+        normalized === 'auto' ||
+        normalized === 'auto (ip based)' ||
+        normalized === 'auto (ip base)' ||
+        normalized === '自动 (基于ip)' ||
+        normalized === '自动 (基于 ip)';
+}
+
+function hasValidGeolocation(geo) {
+    return !!geo &&
+        typeof geo.latitude === 'number' &&
+        typeof geo.longitude === 'number' &&
+        Number.isFinite(geo.latitude) &&
+        Number.isFinite(geo.longitude);
+}
+
+function getAutoIpBasePolicy(fingerprint = {}) {
+    const timezone = isAutoTimezoneValue(fingerprint.timezone);
+    const location = !hasValidGeolocation(fingerprint.geolocation) && isAutoIpBasedCityValue(fingerprint.city);
+    return {
+        timezone,
+        location,
+        enabled: timezone || location
+    };
+}
+
+function getAutoIpBaseCachePath(profileId) {
+    const cachePath = path.resolve(DATA_PATH, String(profileId || ''), 'ip-base-cache.json');
+    const dataRoot = path.resolve(DATA_PATH);
+    const relative = path.relative(dataRoot, cachePath);
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return null;
+    return cachePath;
+}
+
+function maskIpForLog(ip) {
+    const parts = String(ip || '').split('.');
+    if (parts.length !== 4) return String(ip || '').slice(0, 24);
+    return `${parts[0]}.${parts[1]}.${parts[2]}.x`;
+}
+
+async function readAutoIpBaseCache(profileId) {
+    try {
+        const cachePath = getAutoIpBaseCachePath(profileId);
+        if (!cachePath || !fs.existsSync(cachePath)) return null;
+        const cache = await fs.readJson(cachePath);
+        return cache && typeof cache === 'object' ? cache : null;
+    } catch (e) {
+        return null;
+    }
+}
+
+async function writeAutoIpBaseCache(profileId, snapshot) {
+    if (!snapshot || !snapshot.ip) return;
+    const cachePath = getAutoIpBaseCachePath(profileId);
+    if (!cachePath) return;
+    await fs.ensureDir(path.dirname(cachePath));
+    await fs.writeJson(cachePath, {
+        ...snapshot,
+        updatedAt: snapshot.updatedAt || Date.now()
+    });
+}
+
+function isValidTimezoneId(timezone) {
+    const value = String(timezone || '').trim();
+    if (!value || isAutoTimezoneValue(value)) return false;
+    try {
+        new Intl.DateTimeFormat('en-US', { timeZone: value }).format(new Date());
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
+function parseIpInfoSnapshot(payload = {}) {
+    const ip = String(payload.ip || '').trim();
+    if (!ip) return null;
+
+    const [latRaw, lngRaw] = String(payload.loc || '').split(',');
+    const latitude = Number(latRaw);
+    const longitude = Number(lngRaw);
+    const hasGeo = Number.isFinite(latitude) && Number.isFinite(longitude);
+    const timezone = isValidTimezoneId(payload.timezone) ? String(payload.timezone).trim() : null;
+
+    return {
+        ip,
+        loc: hasGeo ? `${latitude},${longitude}` : '',
+        latitude: hasGeo ? latitude : null,
+        longitude: hasGeo ? longitude : null,
+        accuracy: 100,
+        timezone,
+        city: String(payload.city || '').trim(),
+        region: String(payload.region || '').trim(),
+        country: String(payload.country || '').trim(),
+        org: String(payload.org || '').trim(),
+        source: 'ipinfo.io',
+        updatedAt: Date.now()
+    };
+}
+
+async function fetchIpInfoSnapshot(localPort, timeoutMs = 8000) {
+    const requestOptions = {
+        headers: {
+            'User-Agent': 'curl/8.7.1',
+            'Accept': 'application/json'
+        }
+    };
+    if (localPort) {
+        requestOptions.agent = await createSocksProxyAgent(`socks5h://127.0.0.1:${localPort}`);
+    }
+
+    return await new Promise((resolve, reject) => {
+        let raw = '';
+        const req = https.get('https://ipinfo.io/json', requestOptions, (res) => {
+            const statusCode = Number(res.statusCode || 0);
+            res.setEncoding('utf8');
+            res.on('data', (chunk) => {
+                raw += chunk;
+                if (raw.length > 128 * 1024) {
+                    req.destroy(new Error('ipinfo response too large'));
+                }
+            });
+            res.on('end', () => {
+                if (statusCode < 200 || statusCode >= 300) {
+                    reject(new Error(`ipinfo HTTP ${statusCode}`));
+                    return;
+                }
+                try {
+                    const snapshot = parseIpInfoSnapshot(JSON.parse(raw));
+                    if (!snapshot) {
+                        reject(new Error('ipinfo response missing ip'));
+                        return;
+                    }
+                    resolve(snapshot);
+                } catch (err) {
+                    reject(err);
+                }
+            });
+        });
+        req.setTimeout(timeoutMs, () => {
+            req.destroy(new Error('ipinfo request timeout'));
+        });
+        req.on('error', reject);
+    });
+}
+
+function isAutoIpBaseSourceUsable(source, policy) {
+    if (!source || !source.ip) return false;
+    if (policy.location) {
+        const latitude = Number(source.latitude);
+        const longitude = Number(source.longitude);
+        if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return false;
+    }
+    if (policy.timezone && !isValidTimezoneId(source.timezone)) return false;
+    return true;
+}
+
+function buildAutoIpBaseFingerprint(baseFingerprint = {}, source, policy) {
+    if (!isAutoIpBaseSourceUsable(source, policy)) return null;
+
+    const nextFingerprint = { ...baseFingerprint };
+    if (policy.location) {
+        nextFingerprint.city = source.city || source.region || source.country || 'Auto (IP Based)';
+        nextFingerprint.geolocation = {
+            latitude: Number(source.latitude),
+            longitude: Number(source.longitude),
+            accuracy: Number(source.accuracy) || 100
+        };
+    }
+    if (policy.timezone && isValidTimezoneId(source.timezone)) {
+        nextFingerprint.timezone = source.timezone;
+    }
+    return nextFingerprint;
+}
+
+async function resolveAutoIpBaseFingerprintAfterLaunch(profileId, baseFingerprint, localPort) {
+    const policy = getAutoIpBasePolicy(baseFingerprint);
+    if (!policy.enabled) return null;
+
+    const cache = await readAutoIpBaseCache(profileId);
+    const snapshot = await fetchIpInfoSnapshot(localPort);
+    const cacheMatchesCurrentIp = cache && cache.ip && snapshot.ip && cache.ip === snapshot.ip;
+    const source = cacheMatchesCurrentIp && isAutoIpBaseSourceUsable(cache, policy)
+        ? { ...cache, checkedAt: Date.now() }
+        : snapshot;
+
+    if (!cacheMatchesCurrentIp || !isAutoIpBaseSourceUsable(cache, policy)) {
+        await writeAutoIpBaseCache(profileId, snapshot);
+    }
+
+    const resolvedFingerprint = buildAutoIpBaseFingerprint(baseFingerprint, source, policy);
+    if (!resolvedFingerprint) return null;
+
+    return {
+        fingerprint: resolvedFingerprint,
+        source,
+        policy,
+        cacheHit: !!cacheMatchesCurrentIp
+    };
+}
+
 function ensureProxyStrValid(proxyStr) {
     const raw = String(proxyStr || '').trim();
     if (!raw) {
@@ -1445,6 +1660,7 @@ async function buildProfileFromInput(rawData, profiles, settings, existingProfil
         proxyId: proxyFields.proxyId,
         proxyStr: proxyFields.proxyStr,
         tags: normalizeTags(firstDefined(data.tags, existingProfile?.tags, [])),
+        notes: normalizeProfileNotes(firstDefined(data.notes, data.note, data.profileNotes, existingProfile?.notes, existingProfile?.note, existingProfile?.profileNotes, '')),
         fingerprint,
         preProxyOverride: preProxyFields.preProxyOverride,
         preProxyId: preProxyFields.preProxyId,
@@ -1727,6 +1943,7 @@ async function handleApiRequest(method, pathname, body, params, context = {}) {
                             proxyId: item.proxyId || null,
                             proxyStr: item.proxyStr || '',
                             tags: item.tags || [],
+                            notes: normalizeProfileNotes(firstDefined(item.notes, item.note, item.profileNotes, '')),
                             fingerprint: item.fingerprint || await generateFingerprint({}),
                             createdAt: Date.now()
                         };
@@ -2385,7 +2602,7 @@ async function generateExtension(profilePath, fingerprint, profileName, watermar
         content_scripts: [
             {
                 matches: ["<all_urls>"],
-                js: ["content.js"],
+                js: ["geo.js", "content.js"],
                 run_at: "document_start",
                 all_frames: true,
                 match_about_blank: true,
@@ -2405,8 +2622,10 @@ async function generateExtension(profilePath, fingerprint, profileName, watermar
         action: { default_popup: "popup.html" }
     };
     const style = watermarkStyle || 'enhanced';
+    const geoScriptContent = getGeolocationScript(fingerprint);
     const scriptContent = getInjectScript(fingerprint, profileName, style);
     await fs.writeJson(path.join(extDir, 'manifest.json'), manifest);
+    await fs.writeFile(path.join(extDir, 'geo.js'), geoScriptContent);
     await fs.writeFile(path.join(extDir, 'content.js'), scriptContent);
 
     // --- background.js ---
@@ -4831,7 +5050,7 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
 
         // 时区设置
         const env = { ...process.env };
-        if (profile.fingerprint?.timezone && profile.fingerprint.timezone !== 'Auto') {
+        if (profile.fingerprint?.timezone && !isAutoTimezoneValue(profile.fingerprint.timezone)) {
             env.TZ = profile.fingerprint.timezone;
         }
 
@@ -4858,7 +5077,9 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
         const acceptLanguageHeader = shortLang && shortLang !== targetLang
             ? `${targetLang},${shortLang};q=0.9`
             : targetLang;
-        const fingerprintInjectScript = getInjectScript(profile.fingerprint, profile.name, style);
+        let runtimeFingerprint = profile.fingerprint;
+        let geolocationScript = getGeolocationScript(runtimeFingerprint);
+        let fingerprintInjectScript = getInjectScript(runtimeFingerprint, profile.name, style);
         const watermarkInjectScript = getWatermarkScript(profile.name, style);
         const enableWebglOverride = !!(
             profile.fingerprint?.webglProfile !== 'none' &&
@@ -5085,6 +5306,9 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
             if (!page) return;
             try {
                 try {
+                    await page.evaluateOnNewDocument(geolocationScript);
+                } catch (e) { }
+                try {
                     await page.evaluateOnNewDocument(fingerprintInjectScript);
                 } catch (e) { }
                 try {
@@ -5094,6 +5318,9 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
                     await page.evaluateOnNewDocument(webglOverrideScript);
                 } catch (e) { }
 
+                try {
+                    await page.evaluate(geolocationScript);
+                } catch (e) { }
                 try {
                     await page.evaluate(fingerprintInjectScript);
                 } catch (e) { }
@@ -5126,9 +5353,9 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
                     } catch (e) { }
                 }
 
-                if (profile.fingerprint?.timezone && profile.fingerprint.timezone !== 'Auto') {
+                if (runtimeFingerprint?.timezone && !isAutoTimezoneValue(runtimeFingerprint.timezone)) {
                     try {
-                        await session.send('Emulation.setTimezoneOverride', { timezoneId: profile.fingerprint.timezone });
+                        await session.send('Emulation.setTimezoneOverride', { timezoneId: runtimeFingerprint.timezone });
                     } catch (e) { }
                 }
 
@@ -5272,13 +5499,49 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
         sender.send('profile-status', { id: profileId, status: 'running' });
         refreshTrayMenu().catch(() => { });
 
+        const applyAutoIpBaseRuntime = async () => {
+            const policy = getAutoIpBasePolicy(profile.fingerprint);
+            if (!policy.enabled) return;
+            try {
+                const resolved = await resolveAutoIpBaseFingerprintAfterLaunch(profileId, profile.fingerprint, localPort);
+                if (!resolved || !resolved.fingerprint) return;
+
+                runtimeFingerprint = resolved.fingerprint;
+                geolocationScript = getGeolocationScript(runtimeFingerprint);
+                fingerprintInjectScript = getInjectScript(runtimeFingerprint, profile.name, style);
+
+                try {
+                    const pages = await browser.pages();
+                    for (const page of pages) {
+                        await applyPageOverrides(page);
+                    }
+                } catch (e) { }
+
+                const parts = [];
+                if (resolved.policy.location && hasValidGeolocation(runtimeFingerprint.geolocation)) {
+                    parts.push('geo=resolved');
+                }
+                if (resolved.policy.timezone && isValidTimezoneId(runtimeFingerprint.timezone)) {
+                    parts.push(`timezone=${runtimeFingerprint.timezone}`);
+                }
+                console.log(`[Auto IP Base] ${profile.name || profileId}: ${resolved.cacheHit ? 'reused cache' : 'refreshed'} ip=${maskIpForLog(resolved.source.ip)}${parts.length ? ` ${parts.join(' ')}` : ''}`);
+            } catch (err) {
+                console.warn(`[Auto IP Base] ${profile.name || profileId}: ${err?.message || err}`);
+            }
+        };
+        setTimeout(() => {
+            applyAutoIpBaseRuntime().catch((err) => {
+                console.warn(`[Auto IP Base] ${profile.name || profileId}: ${err?.message || err}`);
+            });
+        }, 0);
+
         // CDP Timezone Override (Windows only)
         // On macOS/Linux, TZ env var changes V8's timezone natively.
         // On Windows, V8 ignores TZ and uses Win32 API, so we use CDP instead.
         // This changes V8's internal timezone at the engine level - all Date methods
         // (toString, getTimezoneOffset, getHours, etc.) and Intl APIs work correctly.
-        const targetTimezone = profile.fingerprint?.timezone;
-        if (process.platform === 'win32' && targetTimezone && targetTimezone !== 'Auto') {
+        const targetTimezone = runtimeFingerprint?.timezone;
+        if (process.platform === 'win32' && targetTimezone && !isAutoTimezoneValue(targetTimezone)) {
             try {
                 const pages = await browser.pages();
                 for (const page of pages) {

@@ -70,7 +70,7 @@ function loadProfileCopyForTest() {
 function loadFingerprintForTest() {
   const fingerprintPath = path.join(__dirname, '..', 'src', 'main', 'fingerprint.js');
   const source = fs.readFileSync(fingerprintPath, 'utf8')
-    .replace(/export \{ generateFingerprint, getInjectScript, getWorkerInjectScript, getWatermarkScript, deriveProfileNoiseSeed, applyProfileScopedNoiseSeed, ensureProfileScopedNoiseSeed, rotateProfileNoiseSeed, buildCanvasFingerprintPreview \};\s*$/, 'module.exports = { generateFingerprint, getInjectScript, getWorkerInjectScript, getWatermarkScript, deriveProfileNoiseSeed, applyProfileScopedNoiseSeed, ensureProfileScopedNoiseSeed, rotateProfileNoiseSeed, buildCanvasFingerprintPreview };');
+    .replace(/export \{([^}]+)\};\s*$/, 'module.exports = {$1};');
   const sandbox = {
     require,
     module: { exports: {} },
